@@ -76,12 +76,21 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&run_bench.step);
 
     // `zig build node -- <args>` — a standalone networked node process.
+    // `-Dnode-safe` builds it in ReleaseSafe (runtime integer-overflow / bounds
+    // traps kept on) — recommended for deployment, where the node validates
+    // untrusted network input. With a libc (e.g. musl) target this still uses
+    // the C allocator, so there is no debug-allocator leak noise. Default is
+    // ReleaseFast for local dev/mining speed.
+    const node_safe = b.option(bool, "node-safe", "Build the node in ReleaseSafe (recommended for deployment)") orelse false;
     const node_mod = b.createModule(.{
         .root_source_file = b.path("src/node_main.zig"),
         .target = target,
-        // ReleaseFast: uses the thread-safe smp allocator (no debug leak-tracking
-        // noise; the node intentionally persists block memory for the chain).
-        .optimize = .ReleaseFast,
+        .optimize = if (node_safe) .ReleaseSafe else .ReleaseFast,
+        // Link libc so the runtime uses the C allocator: no debug-allocator
+        // leak-tracking (the node deliberately retains the chain's working set
+        // for its lifetime), while ReleaseSafe's overflow/bounds traps stay on.
+        // With a musl target this still produces a static binary.
+        .link_libc = true,
     });
     const node_exe = b.addExecutable(.{ .name = "zigchain-node", .root_module = node_mod });
     b.installArtifact(node_exe);

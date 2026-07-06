@@ -27,9 +27,11 @@ ENV PATH="/opt/zig:${PATH}"
 WORKDIR /src
 COPY . .
 
-# Static musl build → runs on a bare Alpine (or scratch) image. (The node's
-# optimize mode is set in build.zig; the target selects static musl.)
-RUN zig build -Dtarget=x86_64-linux-musl \
+# Static musl build → runs on a bare Alpine (or scratch) image. `-Dnode-safe`
+# builds the node in ReleaseSafe (integer-overflow / bounds traps on); with the
+# musl (libc) target this uses the C allocator, so there is no leak-tracking
+# noise while keeping the safety checks a consensus node wants.
+RUN zig build -Dtarget=x86_64-linux-musl -Dnode-safe=true \
  && strip zig-out/bin/zigchain-node
 
 # ---- runtime stage: minimal ----
