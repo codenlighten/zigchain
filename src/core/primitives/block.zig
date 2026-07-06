@@ -19,7 +19,13 @@ pub const BlockHeader = struct {
     /// Parent block ids. Genesis has an empty parent set.
     parents: []const Hash256,
     timestamp: u64,
+    /// Commitment to the transactions (by txid — witness-free).
     merkle_root: Hash256,
+    /// Commitment to the segregated witnesses. Because the header commits to
+    /// them, a node may PRUNE witnesses past finality yet still prove that what
+    /// it once held was exactly what consensus accepted — pruning stays
+    /// trust-minimized rather than "trust me the signatures were valid".
+    witness_root: Hash256,
 
     pub fn encode(self: BlockHeader, w: *codec.Writer) !void {
         try w.writeU32(self.version);
@@ -27,6 +33,7 @@ pub const BlockHeader = struct {
         for (self.parents) |p| try w.writeHash(p);
         try w.writeU64(self.timestamp);
         try w.writeHash(self.merkle_root);
+        try w.writeHash(self.witness_root);
     }
 
     pub fn id(self: BlockHeader, gpa: std.mem.Allocator) !Hash256 {
@@ -46,14 +53,42 @@ pub const Block = struct {
         return self.header.id(gpa);
     }
 
-    /// Recompute the merkle root from the block's transactions.
+    /// Recompute the merkle root from the block's transactions (by txid).
     pub fn computeMerkleRoot(self: Block, gpa: std.mem.Allocator) !Hash256 {
         var ids = try gpa.alloc(Hash256, self.txs.len);
         defer gpa.free(ids);
         for (self.txs, 0..) |t, i| ids[i] = try t.txid(gpa);
         return merkleRoot(gpa, ids);
     }
+
+    /// Recompute the witness merkle root — the root over each transaction's
+    /// witness bundle. Pruning drops the witnesses but keeps this commitment.
+    pub fn computeWitnessRoot(self: Block, gpa: std.mem.Allocator) !Hash256 {
+        var leaves = try gpa.alloc(Hash256, self.txs.len);
+        defer gpa.free(leaves);
+        for (self.txs, 0..) |t, i| leaves[i] = try txWitnessHash(gpa, t);
+        return merkleRoot(gpa, leaves);
+    }
+
+    /// Verify both header commitments against the block body. A pruned node runs
+    /// this once (while it still holds witnesses) to accept a block; afterwards
+    /// the header alone attests to what was verified.
+    pub fn verifyCommitments(self: Block, gpa: std.mem.Allocator) !bool {
+        const mr = try self.computeMerkleRoot(gpa);
+        if (!std.mem.eql(u8, &mr, &self.header.merkle_root)) return false;
+        const wr = try self.computeWitnessRoot(gpa);
+        return std.mem.eql(u8, &wr, &self.header.witness_root);
+    }
 };
+
+/// Hash of one transaction's witness bundle (its segregated signatures/keys).
+fn txWitnessHash(gpa: std.mem.Allocator, tx: Transaction) !Hash256 {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    var w = codec.Writer{ .list = &list, .gpa = gpa };
+    try tx.encodeWitnesses(&w);
+    return hashmod.hash(.witness, list.items);
+}
 
 /// Merkle root over `leaves`, with domain-separated leaf and node hashing.
 ///
@@ -121,6 +156,7 @@ test "block id commits to header, is deterministic" {
         .parents = &.{[_]u8{0xAB} ** 32},
         .timestamp = 1_700_000_000,
         .merkle_root = hashmod.zero,
+        .witness_root = hashmod.zero,
     };
     const id1 = try h.id(gpa);
     const id2 = try h.id(gpa);
@@ -130,4 +166,42 @@ test "block id commits to header, is deterministic" {
     var h2 = h;
     h2.merkle_root = [_]u8{0xFF} ** 32;
     try testing.expect(!std.mem.eql(u8, &id1, &(try h2.id(gpa))));
+
+    // The witness root is committed too: changing it changes the id.
+    var h3 = h;
+    h3.witness_root = [_]u8{0x11} ** 32;
+    try testing.expect(!std.mem.eql(u8, &id1, &(try h3.id(gpa))));
+}
+
+test "witness commitment: verifies intact block, detects tampered witness" {
+    const gpa = testing.allocator;
+    const tx_mod2 = @import("types.zig");
+
+    var tx = tx_mod2.Transaction{
+        .version = 1,
+        .inputs = &.{.{ .outpoint = .{ .txid = hashmod.zero, .index = 0 } }},
+        .outputs = &.{.{ .value = 5, .scheme = .ml_dsa_44, .commitment = hashmod.zero }},
+        .witnesses = &.{.{ .scheme = .ml_dsa_44, .pubkey = "PUBKEY", .signature = "SIGNATURE" }},
+    };
+
+    var blk = Block{
+        .header = .{
+            .version = 1,
+            .parents = &.{},
+            .timestamp = 1,
+            .merkle_root = undefined,
+            .witness_root = undefined,
+        },
+        .txs = @as([]const tx_mod2.Transaction, &.{tx})[0..1],
+    };
+    blk.header.merkle_root = try blk.computeMerkleRoot(gpa);
+    blk.header.witness_root = try blk.computeWitnessRoot(gpa);
+    try testing.expect(try blk.verifyCommitments(gpa));
+
+    // Tamper with the witness (forge a signature) — the txid/merkle root is
+    // unchanged (witnesses are segregated) but the witness commitment breaks.
+    tx.witnesses = &.{.{ .scheme = .ml_dsa_44, .pubkey = "PUBKEY", .signature = "FORGED!!!" }};
+    var tampered = blk;
+    tampered.txs = @as([]const tx_mod2.Transaction, &.{tx})[0..1];
+    try testing.expect(!try tampered.verifyCommitments(gpa));
 }

@@ -15,6 +15,7 @@ pub const block = @import("core/primitives/block.zig");
 pub const dag = @import("core/consensus/dag.zig");
 pub const ghostdag = @import("core/consensus/ghostdag.zig");
 pub const processor = @import("core/consensus/processor.zig");
+pub const mass = @import("core/consensus/mass.zig");
 
 test {
     // Pull every module's tests into the root test binary.
@@ -28,4 +29,5 @@ test {
     _ = dag;
     _ = ghostdag;
     _ = processor;
+    _ = mass;
 }
