@@ -38,13 +38,39 @@ pub fn readExact(fd: i32, buf: []u8) Error!void {
     }
 }
 
-pub const Tag = enum(u8) { hello = 1, inv = 2, get_block = 3, block = 4 };
+pub const Tag = enum(u8) { hello = 1, inv = 2, get_block = 3, block = 4, getaddr = 5, addr = 6 };
+
+/// A peer's network address. Encoded as 6 bytes: 4-byte IPv4 + 2-byte LE port.
+pub const NetAddr = struct {
+    ip: [4]u8,
+    port: u16,
+
+    pub fn eql(a: NetAddr, b: NetAddr) bool {
+        return a.port == b.port and std.mem.eql(u8, &a.ip, &b.ip);
+    }
+    pub fn write6(self: NetAddr, out: *[6]u8) void {
+        @memcpy(out[0..4], &self.ip);
+        std.mem.writeInt(u16, out[4..6], self.port, .little);
+    }
+    pub fn read6(buf: []const u8) NetAddr {
+        return .{ .ip = buf[0..4].*, .port = std.mem.readInt(u16, buf[4..6], .little) };
+    }
+};
+
+/// hello advertises the sender's protocol version AND its listen port, so a node
+/// that accepted the connection (and thus sees only an ephemeral source port) can
+/// still learn the peer's real dial address for peer exchange.
+pub const Hello = struct { version: u32, listen_port: u16 };
+
+pub const max_addrs_per_msg: usize = 64;
 
 pub const Message = union(Tag) {
-    hello: u32, // protocol version
+    hello: Hello,
     inv: Hash256, // "I have this block"
     get_block: Hash256, // "send me this block"
     block: []const u8, // an encoded block (references the receive buffer)
+    getaddr: void, // "tell me peers you know"
+    addr: []const u8, // a list of peers: N × 6 bytes (references the receive buffer)
 };
 
 pub fn sendMessage(fd: i32, gpa: std.mem.Allocator, msg: Message) Error!void {
@@ -52,13 +78,15 @@ pub fn sendMessage(fd: i32, gpa: std.mem.Allocator, msg: Message) Error!void {
     defer payload.deinit(gpa);
     try payload.append(gpa, @intFromEnum(std.meta.activeTag(msg)));
     switch (msg) {
-        .hello => |v| {
-            var b: [4]u8 = undefined;
-            std.mem.writeInt(u32, &b, v, .little);
+        .hello => |h| {
+            var b: [6]u8 = undefined;
+            std.mem.writeInt(u32, b[0..4], h.version, .little);
+            std.mem.writeInt(u16, b[4..6], h.listen_port, .little);
             try payload.appendSlice(gpa, &b);
         },
         .inv, .get_block => |id| try payload.appendSlice(gpa, &id),
-        .block => |bytes| try payload.appendSlice(gpa, bytes),
+        .block, .addr => |bytes| try payload.appendSlice(gpa, bytes),
+        .getaddr => {},
     }
     var lenb: [4]u8 = undefined;
     std.mem.writeInt(u32, &lenb, @intCast(payload.items.len), .little);
@@ -84,7 +112,10 @@ pub fn recvMessage(fd: i32, gpa: std.mem.Allocator) Error!Recv {
 
     const data = buf[1..];
     const msg: Message = switch (buf[0]) {
-        1 => .{ .hello = if (data.len >= 4) std.mem.readInt(u32, data[0..4], .little) else 0 },
+        1 => .{ .hello = .{
+            .version = if (data.len >= 4) std.mem.readInt(u32, data[0..4], .little) else 0,
+            .listen_port = if (data.len >= 6) std.mem.readInt(u16, data[4..6], .little) else 0,
+        } },
         2, 3 => msg: {
             if (data.len < 32) return Error.BadFrame;
             var id: Hash256 = undefined;
@@ -92,6 +123,12 @@ pub fn recvMessage(fd: i32, gpa: std.mem.Allocator) Error!Recv {
             break :msg if (buf[0] == 2) Message{ .inv = id } else Message{ .get_block = id };
         },
         4 => .{ .block = data },
+        5 => .getaddr,
+        6 => msg: {
+            // N × 6 bytes; reject a ragged or over-long address list.
+            if (data.len % 6 != 0 or data.len / 6 > max_addrs_per_msg) return Error.BadFrame;
+            break :msg .{ .addr = data };
+        },
         else => return Error.BadFrame,
     };
     return .{ .msg = msg, .buffer = buf };
@@ -136,6 +173,14 @@ pub fn tcpConnect(ip: [4]u8, port: u16) SocketError!i32 {
     return fd;
 }
 
+/// The remote peer's IPv4 address for a connected socket (0.0.0.0 on failure).
+pub fn peerIp(fd: i32) [4]u8 {
+    var addr: linux.sockaddr.in = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    if (linux.errno(linux.getpeername(fd, @ptrCast(&addr), &len)) != .SUCCESS) return .{ 0, 0, 0, 0 };
+    return @bitCast(addr.addr);
+}
+
 /// Serialize a block to owned bytes for sending as a `.block` message.
 pub fn encodeBlock(gpa: std.mem.Allocator, block: blk.Block) ![]u8 {
     var list: std.ArrayList(u8) = .empty;
@@ -158,6 +203,39 @@ fn socketpair() ![2]i32 {
     const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds);
     if (linux.errno(rc) != .SUCCESS) return error.SocketpairFailed;
     return fds;
+}
+
+test "peer-exchange messages round-trip (hello with port, getaddr, addr list)" {
+    const gpa = testing.allocator;
+    const fds = try socketpair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    // hello now carries the listen port.
+    try sendMessage(fds[0], gpa, .{ .hello = .{ .version = 1, .listen_port = 9000 } });
+    const h = try recvMessage(fds[1], gpa);
+    defer gpa.free(h.buffer);
+    try testing.expect(h.msg == .hello);
+    try testing.expectEqual(@as(u16, 9000), h.msg.hello.listen_port);
+
+    try sendMessage(fds[0], gpa, .getaddr);
+    const g = try recvMessage(fds[1], gpa);
+    defer gpa.free(g.buffer);
+    try testing.expect(g.msg == .getaddr);
+
+    // An addr list of two peers.
+    const a0 = NetAddr{ .ip = .{ 10, 0, 0, 1 }, .port = 9001 };
+    const a1 = NetAddr{ .ip = .{ 127, 0, 0, 1 }, .port = 9002 };
+    var body: [12]u8 = undefined;
+    a0.write6(body[0..6]);
+    a1.write6(body[6..12]);
+    try sendMessage(fds[0], gpa, .{ .addr = &body });
+    const a = try recvMessage(fds[1], gpa);
+    defer gpa.free(a.buffer);
+    try testing.expect(a.msg == .addr);
+    try testing.expectEqual(@as(usize, 12), a.msg.addr.len);
+    try testing.expect(NetAddr.read6(a.msg.addr[0..6]).eql(a0));
+    try testing.expect(NetAddr.read6(a.msg.addr[6..12]).eql(a1));
 }
 
 test "oversized and empty frames are rejected (DoS guard)" {

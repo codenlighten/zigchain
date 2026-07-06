@@ -32,6 +32,8 @@ pub const parallel = @import("core/consensus/parallel.zig");
 pub const fees = @import("core/consensus/fees.zig");
 pub const mempool = @import("node/mempool.zig");
 pub const wire = @import("net/wire.zig");
+pub const addrbook = @import("net/addrbook.zig");
+pub const ratelimit = @import("net/ratelimit.zig");
 pub const store = @import("node/store.zig");
 pub const license = @import("licensing/license.zig");
 
@@ -65,6 +67,8 @@ test {
     _ = mempool;
     _ = wire;
     _ = store;
+    _ = addrbook;
+    _ = ratelimit;
     _ = license;
     _ = @import("tests/properties.zig");
     _ = @import("sim/simnet.zig");

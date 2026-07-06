@@ -14,6 +14,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const wire = @import("net/wire.zig");
+const ratelimit = @import("net/ratelimit.zig");
+const addrbook = @import("net/addrbook.zig");
 const store_mod = @import("node/store.zig");
 const chain = @import("core/consensus/chain.zig");
 const blk = @import("core/primitives/block.zig");
@@ -48,10 +50,28 @@ fn sleepMs(ms: u64) void {
 // DoS bounds for a node facing untrusted peers.
 const max_peers: usize = 128;
 const max_orphans: usize = 8192;
+const max_book: usize = 1024; // known-peer address book cap
+// Per-peer message rate: a 512-message burst, refilling ~500/s. Enough for a
+// sync flood of blocks, but a peer that sustains more is dropped.
+const rate_burst: u32 = 512;
+const rate_refill_ms: u32 = 2;
+const discovery_interval_ms: u64 = 2000;
+
+const NetAddr = wire.NetAddr;
+
+fn nowMs() u64 {
+    return nowNs() / 1_000_000;
+}
+
+fn containsAddr(list: []const NetAddr, a: NetAddr) bool {
+    for (list) |x| if (x.eql(a)) return true;
+    return false;
+}
 
 const Peer = struct {
     fd: i32,
     send: SpinLock = .{},
+    limiter: ratelimit.RateLimiter,
 };
 
 /// A block received before its parents — held until they arrive.
@@ -66,6 +86,11 @@ const Node = struct {
     store: ?store_mod.BlockStore = null, // persistent block log (if --datadir)
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     name: []const u8,
+    // Peer discovery (PEX). `book` is the set of known dial addresses; `dialed`
+    // records addresses we've already reached out to. Both guarded by `lock`.
+    listen_port: u16 = 0,
+    book: addrbook.AddressBook = undefined,
+    dialed: std.ArrayList(NetAddr) = .empty,
 
     fn log(self: *Node, comptime fmt: []const u8, args: anytype) void {
         std.debug.print("[{s}] " ++ fmt ++ "\n", .{self.name} ++ args);
@@ -91,7 +116,7 @@ fn addPeer(node: *Node, fd: i32) void {
         _ = linux.close(fd);
         return;
     };
-    peer.* = .{ .fd = fd };
+    peer.* = .{ .fd = fd, .limiter = ratelimit.RateLimiter.init(rate_burst, rate_refill_ms, nowMs()) };
     node.lock.lock();
     node.peers.append(node.gpa, peer) catch {};
     node.lock.unlock();
@@ -129,13 +154,45 @@ fn sendTipInv(node: *Node, peer: *Peer) void {
     if (tip) |t| sendOne(node, peer, .{ .inv = t });
 }
 
+/// Reply to `getaddr` with up to `max_addrs_per_msg` known addresses.
+fn sendAddrs(node: *Node, peer: *Peer) void {
+    var buf: [wire.max_addrs_per_msg * 6]u8 = undefined;
+    node.lock.lock();
+    const items = node.book.items();
+    const count = @min(items.len, wire.max_addrs_per_msg);
+    for (items[0..count], 0..) |a, i| a.write6(buf[i * 6 ..][0..6]);
+    node.lock.unlock();
+    if (count > 0) sendOne(node, peer, .{ .addr = buf[0 .. count * 6] });
+}
+
 fn handleConn(node: *Node, peer: *Peer) void {
+    // Introduce ourselves (advertising our listen port) and ask for peers.
+    sendOne(node, peer, .{ .hello = .{ .version = 1, .listen_port = node.listen_port } });
+    sendOne(node, peer, .getaddr);
     sendTipInv(node, peer); // let a joining peer start pulling history
     while (!node.stop.load(.acquire)) {
         const r = wire.recvMessage(peer.fd, node.gpa) catch break;
         defer node.gpa.free(r.buffer);
+        // Rate-limit: a peer that floods faster than the bucket refills is dropped.
+        if (!peer.limiter.allow(nowMs())) {
+            node.log("peer exceeded message rate limit; disconnecting", .{});
+            break;
+        }
         switch (r.msg) {
-            .hello => {},
+            .hello => |h| {
+                // Learn the peer's real dial address: its source IP + advertised port.
+                const a = NetAddr{ .ip = wire.peerIp(peer.fd), .port = h.listen_port };
+                node.lock.lock();
+                _ = node.book.add(a);
+                node.lock.unlock();
+            },
+            .getaddr => sendAddrs(node, peer),
+            .addr => |bytes| {
+                node.lock.lock();
+                var i: usize = 0;
+                while (i + 6 <= bytes.len) : (i += 6) _ = node.book.add(NetAddr.read6(bytes[i .. i + 6]));
+                node.lock.unlock();
+            },
             .inv => |id| {
                 node.lock.lock();
                 const have = node.chain.dag.contains(id);
@@ -285,6 +342,32 @@ fn listen(node: *Node, port: u16) void {
     }
 }
 
+/// Peer discovery: periodically dial known addresses we haven't dialed yet,
+/// up to the peer cap. Addresses come from `hello`/`addr` peer exchange.
+fn discover(node: *Node) void {
+    while (!node.stop.load(.acquire)) {
+        sleepMs(discovery_interval_ms);
+        var targets: [8]NetAddr = undefined;
+        var nt: usize = 0;
+        node.lock.lock();
+        if (node.peers.items.len < max_peers) {
+            for (node.book.items()) |a| {
+                if (nt >= targets.len) break;
+                if (containsAddr(node.dialed.items, a)) continue;
+                targets[nt] = a;
+                nt += 1;
+            }
+            for (targets[0..nt]) |a| node.dialed.append(node.gpa, a) catch {};
+        }
+        node.lock.unlock();
+        for (targets[0..nt]) |a| {
+            const fd = wire.tcpConnect(a.ip, a.port) catch continue;
+            node.log("discovered peer {d}.{d}.{d}.{d}:{d}", .{ a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port });
+            addPeer(node, fd);
+        }
+    }
+}
+
 fn mineLoop(node: *Node, target: usize) void {
     var seq: u64 = 0;
     // target == 0 means "run forever" (daemon mode).
@@ -323,7 +406,7 @@ fn mineLoop(node: *Node, target: usize) void {
     }
 }
 
-const PeerAddr = struct { ip: [4]u8, port: u16 };
+const PeerAddr = NetAddr;
 
 fn parsePeer(s: []const u8) ?PeerAddr {
     const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
@@ -457,6 +540,15 @@ pub fn main(init: std.process.Init) !void {
         node.store = s;
     }
 
+    // Peer discovery state: our own listen address (for self-exclusion) and the
+    // address book seeded with the configured --peer addresses.
+    node.listen_port = port;
+    node.book = addrbook.AddressBook.init(gpa, .{ .ip = .{ 127, 0, 0, 1 }, .port = port }, max_book);
+    for (peer_addrs.items) |pa| {
+        _ = node.book.add(pa);
+        node.dialed.append(gpa, pa) catch {}; // dialed explicitly below; don't re-dial
+    }
+
     if (port > 0) _ = try std.Thread.spawn(.{}, listen, .{ node, port });
     sleepMs(300); // let listeners bind
 
@@ -468,6 +560,10 @@ pub fn main(init: std.process.Init) !void {
         node.log("connected to peer (outbound)", .{});
         addPeer(node, fd);
     }
+
+    // Discover further peers via PEX (needs a listener so discovered peers can
+    // reach us back).
+    if (port > 0) _ = try std.Thread.spawn(.{}, discover, .{node});
     sleepMs(300);
 
     // A daemon (no --blocks target) runs until killed; otherwise it stops at a
