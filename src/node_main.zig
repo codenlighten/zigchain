@@ -59,6 +59,7 @@ const rate_refill_ms: u32 = 2;
 const max_drop_strikes: u32 = 4096; // consecutive rate-limited drops before disconnect
 const discovery_interval_ms: u64 = 2000;
 const dial_cooldown_ms: u64 = 30_000; // minimum interval between dial attempts to one address
+const max_ip_buckets: usize = 65536; // cap on distinct source-IP rate-limit buckets
 
 const NetAddr = wire.NetAddr;
 
@@ -75,8 +76,7 @@ const Peer = struct {
     fd: i32,
     ip: [4]u8,
     send: SpinLock = .{},
-    limiter: ratelimit.RateLimiter,
-    /// The peer's advertised dial address, once its hello is seen (guarded by node.lock).
+    /// The peer's advertised dial address, once its hello is seen (guarded by node.net_lock).
     listen_addr: ?NetAddr = null,
     drop_strikes: u32 = 0, // consecutive rate-limited drops (handleConn thread only)
     /// Reference count: the peer list holds one; broadcastBlock takes one while
@@ -102,9 +102,13 @@ const Orphan = struct { bytes: []u8, parents: []Hash256 };
 const Node = struct {
     gpa: std.mem.Allocator,
     chain: chain.Chain,
-    lock: SpinLock = .{}, // guards chain + peers + orphans
+    lock: SpinLock = .{}, // guards chain + orphans + store
+    net_lock: SpinLock = .{}, // guards peers + book + dialed + ip_limits (never held with `lock`)
     peers: std.ArrayList(*Peer) = .empty,
     orphans: std.AutoHashMapUnmanaged(Hash256, Orphan) = .empty,
+    /// Per-source-IP rate-limit buckets, so a flooder cannot reset its budget by
+    /// reconnecting or opening parallel connections. Bounded by max_ip_buckets.
+    ip_limits: std.AutoHashMapUnmanaged([4]u8, ratelimit.RateLimiter) = .empty,
     store: ?store_mod.BlockStore = null, // persistent block log (if --datadir)
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     name: []const u8,
@@ -129,9 +133,9 @@ const Node = struct {
 };
 
 fn addPeer(node: *Node, fd: i32, ip: [4]u8, listen_addr: ?NetAddr) void {
-    node.lock.lock();
+    node.net_lock.lock();
     const full = node.peers.items.len >= max_peers;
-    node.lock.unlock();
+    node.net_lock.unlock();
     if (full) {
         _ = linux.close(fd);
         node.log("peer limit ({d}) reached; dropped connection", .{max_peers});
@@ -145,11 +149,10 @@ fn addPeer(node: *Node, fd: i32, ip: [4]u8, listen_addr: ?NetAddr) void {
         .fd = fd,
         .ip = ip,
         .listen_addr = listen_addr,
-        .limiter = ratelimit.RateLimiter.init(rate_burst, rate_refill_ms, nowMs()),
     };
-    node.lock.lock();
+    node.net_lock.lock();
     node.peers.append(node.gpa, peer) catch {};
-    node.lock.unlock();
+    node.net_lock.unlock();
     _ = std.Thread.spawn(.{}, handleConn, .{ node, peer }) catch {};
 }
 
@@ -157,19 +160,32 @@ fn addPeer(node: *Node, fd: i32, ip: [4]u8, listen_addr: ?NetAddr) void {
 /// closed and the struct freed only once the last reference (e.g. an in-flight
 /// broadcast) is gone.
 fn removePeer(node: *Node, peer: *Peer) void {
-    node.lock.lock();
+    node.net_lock.lock();
     for (node.peers.items, 0..) |p, i| {
         if (p == peer) {
             _ = node.peers.swapRemove(i);
             break;
         }
     }
-    node.lock.unlock();
+    node.net_lock.unlock();
     peer.release(node.gpa);
 }
 
+/// Per-source-IP token bucket. Returns true if a message from `ip` is within
+/// budget. Buckets persist across connections (so reconnecting doesn't reset the
+/// budget) and are bounded; when the table is full, new IPs fail open.
+fn allowMessage(node: *Node, ip: [4]u8) bool {
+    node.net_lock.lock();
+    defer node.net_lock.unlock();
+    const now = nowMs();
+    if (node.ip_limits.getPtr(ip)) |rl| return rl.allow(now);
+    if (node.ip_limits.count() >= max_ip_buckets) return true;
+    node.ip_limits.put(node.gpa, ip, ratelimit.RateLimiter.init(rate_burst, rate_refill_ms, now)) catch return true;
+    return node.ip_limits.getPtr(ip).?.allow(now);
+}
+
 /// Are we already connected to a node that advertised dial address `a`? Caller
-/// must hold node.lock.
+/// must hold node.net_lock.
 fn connectedToLocked(node: *Node, a: NetAddr) bool {
     for (node.peers.items) |p| {
         if (p.listen_addr) |la| {
@@ -181,13 +197,13 @@ fn connectedToLocked(node: *Node, a: NetAddr) bool {
 
 /// Send an encoded block to every peer except `except_fd`.
 fn broadcastBlock(node: *Node, bytes: []const u8, except_fd: i32) void {
-    node.lock.lock();
+    node.net_lock.lock();
     const snapshot = node.gpa.dupe(*Peer, node.peers.items) catch {
-        node.lock.unlock();
+        node.net_lock.unlock();
         return;
     };
     for (snapshot) |p| p.retain(); // keep peers alive for the send, even if removed concurrently
-    node.lock.unlock();
+    node.net_lock.unlock();
     defer node.gpa.free(snapshot);
     for (snapshot) |p| {
         defer p.release(node.gpa);
@@ -215,11 +231,11 @@ fn sendTipInv(node: *Node, peer: *Peer) void {
 /// Reply to `getaddr` with up to `max_addrs_per_msg` known addresses.
 fn sendAddrs(node: *Node, peer: *Peer) void {
     var buf: [wire.max_addrs_per_msg * 6]u8 = undefined;
-    node.lock.lock();
+    node.net_lock.lock();
     const items = node.book.items();
     const count = @min(items.len, wire.max_addrs_per_msg);
     for (items[0..count], 0..) |a, i| a.write6(buf[i * 6 ..][0..6]);
-    node.lock.unlock();
+    node.net_lock.unlock();
     if (count > 0) sendOne(node, peer, .{ .addr = buf[0 .. count * 6] });
 }
 
@@ -236,7 +252,7 @@ fn handleConn(node: *Node, peer: *Peer) void {
         // Rate-limit: an over-budget message is DROPPED (not processed), which
         // throttles a flood without aborting a legitimate sync burst. Only a peer
         // that sustains the flood past `max_drop_strikes` is disconnected.
-        if (!peer.limiter.allow(nowMs())) {
+        if (!allowMessage(node, peer.ip)) {
             peer.drop_strikes += 1;
             if (peer.drop_strikes > max_drop_strikes) {
                 node.log("peer sustained flooding; disconnecting", .{});
@@ -250,17 +266,17 @@ fn handleConn(node: *Node, peer: *Peer) void {
                 if (h.nonce != 0 and h.nonce == node.self_nonce) break; // connected to ourselves
                 // Learn the peer's real dial address: its source IP + advertised port.
                 const a = NetAddr{ .ip = peer.ip, .port = h.listen_port };
-                node.lock.lock();
+                node.net_lock.lock();
                 peer.listen_addr = a;
                 _ = node.book.add(a);
-                node.lock.unlock();
+                node.net_lock.unlock();
             },
             .getaddr => sendAddrs(node, peer),
             .addr => |bytes| {
-                node.lock.lock();
+                node.net_lock.lock();
                 var i: usize = 0;
                 while (i + 6 <= bytes.len) : (i += 6) _ = node.book.add(NetAddr.read6(bytes[i .. i + 6]));
-                node.lock.unlock();
+                node.net_lock.unlock();
             },
             .inv => |id| {
                 node.lock.lock();
@@ -419,7 +435,7 @@ fn discover(node: *Node) void {
         var targets: [8]NetAddr = undefined;
         var nt: usize = 0;
         const now = nowMs();
-        node.lock.lock();
+        node.net_lock.lock();
         if (node.peers.items.len < max_peers) {
             for (node.book.items()) |a| {
                 if (nt >= targets.len) break;
@@ -432,7 +448,7 @@ fn discover(node: *Node) void {
                 nt += 1;
             }
         }
-        node.lock.unlock();
+        node.net_lock.unlock();
         for (targets[0..nt]) |a| {
             const fd = wire.tcpConnect(a.ip, a.port) catch continue;
             node.log("discovered peer {d}.{d}.{d}.{d}:{d}", .{ a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port });
