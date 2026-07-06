@@ -34,10 +34,14 @@ zig build sim                     # Phase-0 propagation feasibility table
 reimplements the consensus-critical, byte-exact rules (tagged hashing, canonical
 serialization, txid/wtxid/sighash/address/merkle, GHOSTDAG coloring + ordering)
 from the specs — not ported line-by-line — so agreement is real evidence of
-correctness, not a shared bug. Both read `spec/vectors/scenarios.json` and emit a
-canonical report; `tools/difftest.sh` confirms they agree **byte-for-byte** (54
-report lines across transactions, addresses, merkle roots, and 5 DAG scenarios).
-Any divergence is a consensus split, caught before it ships.
+correctness, not a shared bug. `tools/gen_vectors.py` deterministically generates
+a large corpus (`spec/vectors/scenarios.json`: 33 transactions, 304 random DAGs,
+plus address/merkle/mass/finality vectors); both implementations consume it and
+emit a canonical report, and `tools/difftest.sh` confirms they agree
+**byte-for-byte across 3443 report lines**. It covers tagged hashing, canonical
+serialization (txid/wtxid/sighash), address & merkle commitments, block mass,
+finality vote-messages, and GHOSTDAG coloring + ordering. Any divergence is a
+consensus split, caught before it ships — continuous differential fuzzing.
 
 `zig build demo` mines a small BlockDAG of post-quantum-signed transactions
 (with a cross-fork double-spend), orders it with GHOSTDAG, applies it to the

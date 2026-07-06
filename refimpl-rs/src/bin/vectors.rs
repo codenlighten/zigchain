@@ -16,7 +16,20 @@ struct Scenarios {
     #[serde(default)]
     merkle_vectors: Vec<MerkleV>,
     #[serde(default)]
+    finality_vectors: Vec<FinalityV>,
+    #[serde(default)]
     dag_scenarios: Vec<DagV>,
+}
+
+/// Per-scheme verification cost, mirroring the Zig registry.
+fn verify_mass(scheme: u8) -> u64 {
+    match scheme {
+        1 => 1,
+        2 => 2,
+        3 => 64,
+        4 => 128,
+        _ => panic!("unknown scheme {scheme}"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -57,6 +70,11 @@ struct AddrV {
 #[derive(Deserialize)]
 struct MerkleV {
     leaves: Vec<String>,
+}
+#[derive(Deserialize)]
+struct FinalityV {
+    block: String,
+    blue_score: u64,
 }
 #[derive(Deserialize)]
 struct DagV {
@@ -122,6 +140,20 @@ fn main() {
         println!("tx {i} txid {}", to_hex(&tx.txid()));
         println!("tx {i} wtxid {}", to_hex(&tx.wtxid()));
         println!("tx {i} sighash {}", to_hex(&tx.sighash(tv.sighash_scheme)));
+        let mass: u64 = tx
+            .witnesses
+            .iter()
+            .map(|w| verify_mass(w.scheme) + w.pubkey.len() as u64 + w.signature.len() as u64)
+            .sum();
+        println!("tx {i} mass {mass}");
+    }
+
+    for (i, fv) in s.finality_vectors.iter().enumerate() {
+        let block = h32(&fv.block);
+        let mut w = Writer::default();
+        w.hash(&block);
+        w.u64(fv.blue_score);
+        println!("finality {i} vote {}", to_hex(&tagged("finality_vote", &w.0)));
     }
 
     for (i, av) in s.address_vectors.iter().enumerate() {

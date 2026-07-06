@@ -11,6 +11,8 @@ const hashmod = @import("core/crypto/hash.zig");
 const prim = @import("core/primitives/types.zig");
 const pq = @import("core/crypto/pq/registry.zig");
 const blk = @import("core/primitives/block.zig");
+const massmod = @import("core/consensus/mass.zig");
+const finality = @import("core/consensus/finality.zig");
 const Dag = @import("core/consensus/dag.zig").Dag;
 const Ghostdag = @import("core/consensus/ghostdag.zig").Ghostdag;
 
@@ -115,6 +117,18 @@ pub fn main() !void {
             out.line("tx {d} txid {s}\n", .{ i, std.fmt.bytesToHex(try tx.txid(gpa), .lower) });
             out.line("tx {d} wtxid {s}\n", .{ i, std.fmt.bytesToHex(try tx.wtxid(gpa), .lower) });
             out.line("tx {d} sighash {s}\n", .{ i, std.fmt.bytesToHex(try tx.sighash(gpa, scheme), .lower) });
+            out.line("tx {d} mass {d}\n", .{ i, try massmod.txMass(tx) });
+        }
+    }
+
+    // --- finality vote messages ---
+    if (root.object.get("finality_vectors")) |fvs| {
+        for (fvs.array.items, 0..) |fv, i| {
+            const cut = finality.Cut{
+                .block = h32(gpa, field(fv, "block").string),
+                .blue_score = @intCast(intOf(field(fv, "blue_score"))),
+            };
+            out.line("finality {d} vote {s}\n", .{ i, std.fmt.bytesToHex(finality.voteMessage(cut), .lower) });
         }
     }
 
