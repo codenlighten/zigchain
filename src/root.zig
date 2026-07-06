@@ -7,6 +7,7 @@
 
 pub const hash = @import("core/crypto/hash.zig");
 pub const pq = @import("core/crypto/pq/registry.zig");
+pub const sphincs = @import("core/crypto/pq/sphincs.zig");
 pub const codec = @import("core/serialization/codec.zig");
 pub const primitives = @import("core/primitives/types.zig");
 pub const utxo = @import("core/ledger/utxo.zig");
@@ -35,6 +36,7 @@ test {
     // Pull every module's tests into the root test binary.
     _ = hash;
     _ = pq;
+    _ = sphincs;
     _ = codec;
     _ = primitives;
     _ = utxo;

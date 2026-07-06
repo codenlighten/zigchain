@@ -8,20 +8,23 @@
 //!
 //! ML-DSA (Dilithium) is provided natively by the Zig standard library, so our
 //! default hot schemes require no C FFI — a direct win for the memory-safety /
-//! assurance story. The hash-based vault schemes (SLH-DSA / SPHINCS+) are not
-//! yet in std and are reserved here; their backend (vendored, pinned PQClean)
-//! is wired in during Phase 4. Stateful schemes (XMSS/LMS) are permanently
+//! assurance story. The hash-based vault schemes are SPHINCS+ (shake-128, simple),
+//! backed by vendored, pinned, checksummed PQClean C (see `sphincs.zig` and
+//! `vendor/pqclean/`) — the primitive is never hand-rolled. (These are SPHINCS+
+//! round-3.1; FIPS 205 SLH-DSA is the same parameters with different domain
+//! separation, a future drop-in.) Stateful schemes (XMSS/LMS) are permanently
 //! banned from the registry: one-time-key reuse is catastrophic.
 
 const std = @import("std");
+const sphincs = @import("sphincs.zig");
 const MlDsa44 = std.crypto.sign.mldsa.MLDSA44;
 const MlDsa65 = std.crypto.sign.mldsa.MLDSA65;
 
 pub const SchemeTag = enum(u8) {
     ml_dsa_44 = 0x01, // default hot
     ml_dsa_65 = 0x02,
-    slh_dsa_128s = 0x03, // vault / cold (reserved, Phase 4)
-    slh_dsa_128f = 0x04, // vault / cold (reserved, Phase 4)
+    sphincs_shake_128s = 0x03, // vault / cold — small signature (7856 B)
+    sphincs_shake_128f = 0x04, // vault / cold — fast signing (17088 B)
     _, // any other value is consensus-invalid (UnknownScheme)
 };
 
@@ -56,8 +59,8 @@ pub fn info(tag: SchemeTag) Error!SchemeInfo {
             .verify_mass = 2,
             .implemented = true,
         },
-        .slh_dsa_128s => .{ .pubkey_len = 32, .sig_len = 7856, .verify_mass = 64, .implemented = false },
-        .slh_dsa_128f => .{ .pubkey_len = 32, .sig_len = 17088, .verify_mass = 128, .implemented = false },
+        .sphincs_shake_128s => .{ .pubkey_len = 32, .sig_len = 7856, .verify_mass = 64, .implemented = true },
+        .sphincs_shake_128f => .{ .pubkey_len = 32, .sig_len = 17088, .verify_mass = 128, .implemented = true },
         _ => Error.UnknownScheme,
     };
 }
@@ -71,11 +74,16 @@ pub fn verify(tag: SchemeTag, pubkey: []const u8, msg: []const u8, sig: []const 
     if (sig.len != meta.sig_len) return Error.BadSignatureLength;
 
     const ctx = [_]u8{@intFromEnum(tag)}; // bind scheme tag as signature context
-    return switch (tag) {
-        .ml_dsa_44 => verifyMlDsa(MlDsa44, pubkey, msg, sig, &ctx),
-        .ml_dsa_65 => verifyMlDsa(MlDsa65, pubkey, msg, sig, &ctx),
-        else => Error.UnimplementedScheme,
-    };
+    switch (tag) {
+        .ml_dsa_44 => try verifyMlDsa(MlDsa44, pubkey, msg, sig, &ctx),
+        .ml_dsa_65 => try verifyMlDsa(MlDsa65, pubkey, msg, sig, &ctx),
+        // SPHINCS+ has no signature-context parameter; downgrade protection comes
+        // from the scheme tag already being bound into the sighash and the address
+        // commitment (see primitives/types.zig).
+        .sphincs_shake_128f => if (!sphincs.v128f.verify(pubkey, msg, sig)) return Error.InvalidSignature,
+        .sphincs_shake_128s => if (!sphincs.v128s.verify(pubkey, msg, sig)) return Error.InvalidSignature,
+        else => return Error.UnimplementedScheme,
+    }
 }
 
 fn verifyMlDsa(comptime M: type, pubkey: []const u8, msg: []const u8, sig: []const u8, ctx: []const u8) Error!void {
@@ -99,8 +107,27 @@ test "unknown tag is consensus-invalid" {
     try testing.expectError(Error.UnknownScheme, info(@enumFromInt(0x7f)));
 }
 
-test "reserved vault scheme reports unimplemented (not a silent pass)" {
-    try testing.expectError(Error.UnimplementedScheme, verify(.slh_dsa_128s, &[_]u8{0} ** 32, "x", &[_]u8{0} ** 7856));
+test "SPHINCS+ vault scheme verifies end-to-end through the registry" {
+    inline for (.{ .{ SchemeTag.sphincs_shake_128f, sphincs.v128f }, .{ SchemeTag.sphincs_shake_128s, sphincs.v128s } }) |pair| {
+        const tag = pair[0];
+        const variant = pair[1];
+        var seed: [sphincs.seed_len]u8 = undefined;
+        for (&seed, 0..) |*b, i| b.* = @intCast(i);
+        var pk: [sphincs.pubkey_len]u8 = undefined;
+        var sk: [sphincs.sk_len]u8 = undefined;
+        try testing.expect(variant.seedKeypair(&pk, &sk, &seed));
+
+        const msg = "vault sighash";
+        var sigbuf: [17088]u8 = undefined;
+        const sig = variant.sign(sigbuf[0..variant.sig_len], msg, &sk).?;
+
+        try verify(tag, &pk, msg, sig);
+        try testing.expectError(Error.InvalidSignature, verify(tag, &pk, "vault sighasH", sig));
+    }
+}
+
+test "an all-zero signature of the right length is rejected, not a silent pass" {
+    try testing.expectError(Error.InvalidSignature, verify(.sphincs_shake_128s, &[_]u8{0} ** 32, "x", &[_]u8{0} ** 7856));
 }
 
 test "wrong-length inputs rejected before crypto" {

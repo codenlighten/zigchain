@@ -1,10 +1,63 @@
 const std = @import("std");
 
+// Vendored PQClean SPHINCS+ (see vendor/pqclean/). Each scheme's C is the same
+// set of filenames with scheme-prefixed symbols, so the two schemes are built
+// as separate static libraries with isolated include paths (their headers share
+// names). SHAKE/RNG live in one shared library to avoid duplicate symbols.
+const sphincs_files = [_][]const u8{
+    "address.c",     "context_shake.c",      "fors.c",  "hash_shake.c",
+    "merkle.c",      "sign.c",               "utils.c", "utilsx1.c",
+    "wots.c",        "wotsx1.c",             "thash_shake_simple.c",
+};
+
+const PqClean = struct { common: *std.Build.Step.Compile, f128: *std.Build.Step.Compile, s128: *std.Build.Step.Compile };
+
+fn buildPqclean(b: *std.Build, target: std.Build.ResolvedTarget) PqClean {
+    const cflags = [_][]const u8{ "-O3", "-std=c99" };
+
+    const common = b.addLibrary(.{ .name = "pqclean_common", .linkage = .static, .root_module = b.createModule(.{
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    }) });
+    common.root_module.addCSourceFiles(.{ .root = b.path("vendor/pqclean/common"), .files = &.{ "fips202.c", "randombytes.c" }, .flags = &cflags });
+    common.root_module.addIncludePath(b.path("vendor/pqclean/common"));
+
+    const scheme = struct {
+        fn make(bb: *std.Build, t: std.Build.ResolvedTarget, name: []const u8, dir: []const u8, flags: []const []const u8) *std.Build.Step.Compile {
+            const lib = bb.addLibrary(.{ .name = name, .linkage = .static, .root_module = bb.createModule(.{
+                .target = t,
+                .optimize = .ReleaseFast,
+                .link_libc = true,
+            }) });
+            lib.root_module.addCSourceFiles(.{ .root = bb.path(dir), .files = &sphincs_files, .flags = flags });
+            lib.root_module.addIncludePath(bb.path(dir));
+            lib.root_module.addIncludePath(bb.path("vendor/pqclean/common"));
+            return lib;
+        }
+    };
+    return .{
+        .common = common,
+        .f128 = scheme.make(b, target, "pqclean_sphincs_128f", "vendor/pqclean/sphincs-shake-128f-simple", &cflags),
+        .s128 = scheme.make(b, target, "pqclean_sphincs_128s", "vendor/pqclean/sphincs-shake-128s-simple", &cflags),
+    };
+}
+
+fn linkPqclean(artifact: *std.Build.Step.Compile, pq: PqClean) void {
+    artifact.root_module.linkLibrary(pq.f128);
+    artifact.root_module.linkLibrary(pq.s128);
+    artifact.root_module.linkLibrary(pq.common);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     // Government-grade default: ship ReleaseSafe. A deterministic safety trap is
     // strictly preferable to undefined behaviour that could fork the chain.
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseSafe });
+
+    // Vendored post-quantum vault crypto, linked into every artifact that
+    // reaches the scheme registry (i.e. all of them, via root.zig).
+    const pq = buildPqclean(b, target);
 
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -17,9 +70,11 @@ pub fn build(b: *std.Build) void {
         .root_module = root_mod,
         .linkage = .static,
     });
+    linkPqclean(lib, pq);
     b.installArtifact(lib);
 
     const unit_tests = b.addTest(.{ .root_module = root_mod });
+    linkPqclean(unit_tests, pq);
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const test_step = b.step("test", "Run unit tests");
@@ -32,6 +87,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const sim_exe = b.addExecutable(.{ .name = "zigchain-sim", .root_module = sim_mod });
+    linkPqclean(sim_exe, pq);
     b.installArtifact(sim_exe);
     const run_sim = b.addRunArtifact(sim_exe);
     const sim_step = b.step("sim", "Run the propagation simulation");
@@ -44,6 +100,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const demo_exe = b.addExecutable(.{ .name = "zigchain-demo", .root_module = demo_mod });
+    linkPqclean(demo_exe, pq);
     b.installArtifact(demo_exe);
     const run_demo = b.addRunArtifact(demo_exe);
     const demo_step = b.step("demo", "Run the end-to-end chain demo");
@@ -57,6 +114,7 @@ pub fn build(b: *std.Build) void {
     });
     vectors_mod.addAnonymousImport("scenarios_json", .{ .root_source_file = b.path("spec/vectors/scenarios.json") });
     const vectors_exe = b.addExecutable(.{ .name = "zigchain-vectors", .root_module = vectors_mod });
+    linkPqclean(vectors_exe, pq);
     b.installArtifact(vectors_exe);
     const run_vectors = b.addRunArtifact(vectors_exe);
     if (b.args) |args| run_vectors.addArgs(args);
@@ -70,6 +128,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast, // measure real throughput
     });
     const bench_exe = b.addExecutable(.{ .name = "zigchain-bench", .root_module = bench_mod });
+    linkPqclean(bench_exe, pq);
     b.installArtifact(bench_exe);
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run the scaling benchmark");
@@ -93,6 +152,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const node_exe = b.addExecutable(.{ .name = "zigchain-node", .root_module = node_mod });
+    linkPqclean(node_exe, pq);
     b.installArtifact(node_exe);
     const run_node = b.addRunArtifact(node_exe);
     if (b.args) |args| run_node.addArgs(args);
@@ -107,6 +167,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const license_exe = b.addExecutable(.{ .name = "zigchain-license", .root_module = license_mod });
+    linkPqclean(license_exe, pq);
     b.installArtifact(license_exe);
     const run_license = b.addRunArtifact(license_exe);
     if (b.args) |args| run_license.addArgs(args);

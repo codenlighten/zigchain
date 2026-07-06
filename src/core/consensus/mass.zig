@@ -90,7 +90,7 @@ test "a settlement tx with many outputs pays for its bytes" {
 test "vault scheme is heavier than the hot scheme (verify + bytes)" {
     const gpa = testing.allocator;
     const hot = prim.Transaction{ .version = 1, .inputs = &.{}, .outputs = &.{}, .witnesses = &.{dummyWitness(.ml_dsa_44)} };
-    const vault = prim.Transaction{ .version = 1, .inputs = &.{}, .outputs = &.{}, .witnesses = &.{dummyWitness(.slh_dsa_128f)} };
+    const vault = prim.Transaction{ .version = 1, .inputs = &.{}, .outputs = &.{}, .witnesses = &.{dummyWitness(.sphincs_shake_128f)} };
     try testing.expect((try txMass(gpa, vault)) > (try txMass(gpa, hot)));
 }
 
