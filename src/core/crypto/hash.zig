@@ -29,6 +29,7 @@ pub const Domain = enum {
     block_header,
     witness,
     finality_vote,
+    pow,
 
     pub fn context(self: Domain) []const u8 {
         return switch (self) {
@@ -41,6 +42,7 @@ pub const Domain = enum {
             .block_header => "zigchain.v1.block.header",
             .witness => "zigchain.v1.witness",
             .finality_vote => "zigchain.v1.finality.vote",
+            .pow => "zigchain.v1.pow",
         };
     }
 };

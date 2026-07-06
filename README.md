@@ -21,6 +21,8 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 | Tx validation | `src/core/ledger/validation.zig` | Double-spend, value conservation, PQ-signature auth → fee; connect |
 | DAG | `src/core/consensus/dag.zig` | BlockDAG store + deterministic topological order (hash tie-break) |
 | GHOSTDAG | `src/core/consensus/ghostdag.zig` | k-cluster blue-set coloring, blue score, virtual-chain order (spec: `spec/ghostdag.md`) |
+| Proof-of-work | `src/core/consensus/pow.zig` | Compact nBits↔u256 target, meetsTarget, mining, clamped difficulty retarget |
+| Finality | `src/core/consensus/finality.zig` | PQ-BFT finality over a DAG cut (spec: `spec/finality.md`) |
 | Processor | `src/core/consensus/processor.zig` | Applies txs in GHOSTDAG order; deterministic cross-anticone double-spend resolution |
 
 ```

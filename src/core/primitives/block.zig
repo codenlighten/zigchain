@@ -10,6 +10,7 @@ const std = @import("std");
 const hashmod = @import("../crypto/hash.zig");
 const codec = @import("../serialization/codec.zig");
 const tx_mod = @import("types.zig");
+const pow = @import("../consensus/pow.zig");
 
 const Hash256 = hashmod.Hash256;
 const Transaction = tx_mod.Transaction;
@@ -26,6 +27,10 @@ pub const BlockHeader = struct {
     /// it once held was exactly what consensus accepted — pruning stays
     /// trust-minimized rather than "trust me the signatures were valid".
     witness_root: Hash256,
+    /// Compact difficulty target this block must satisfy.
+    bits: u32 = pow.easy_bits,
+    /// Proof-of-work nonce (varied by the miner).
+    nonce: u64 = 0,
 
     pub fn encode(self: BlockHeader, w: *codec.Writer) !void {
         try w.writeU32(self.version);
@@ -34,6 +39,8 @@ pub const BlockHeader = struct {
         try w.writeU64(self.timestamp);
         try w.writeHash(self.merkle_root);
         try w.writeHash(self.witness_root);
+        try w.writeU32(self.bits);
+        try w.writeU64(self.nonce);
     }
 
     pub fn id(self: BlockHeader, gpa: std.mem.Allocator) !Hash256 {
@@ -42,6 +49,33 @@ pub const BlockHeader = struct {
         var w = codec.Writer{ .list = &list, .gpa = gpa };
         try self.encode(&w);
         return hashmod.hash(.block_header, list.items);
+    }
+
+    /// The proof-of-work hash (separate domain from the block id, so the PoW
+    /// function can be swapped without touching identity hashing).
+    pub fn powHash(self: BlockHeader, gpa: std.mem.Allocator) !Hash256 {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        var w = codec.Writer{ .list = &list, .gpa = gpa };
+        try self.encode(&w);
+        return hashmod.hash(.pow, list.items);
+    }
+
+    /// Does this header satisfy its own difficulty target?
+    pub fn validatePow(self: BlockHeader, gpa: std.mem.Allocator) !bool {
+        return pow.meetsTarget(try self.powHash(gpa), self.bits);
+    }
+
+    /// Search for a nonce that satisfies `self.bits`, up to `max_iters`.
+    /// Mutates `self.nonce`. Returns the number of iterations, or error on
+    /// exhaustion.
+    pub fn mine(self: *BlockHeader, gpa: std.mem.Allocator, max_iters: u64) !u64 {
+        var i: u64 = 0;
+        while (i < max_iters) : (i += 1) {
+            self.nonce = i;
+            if (pow.meetsTarget(try self.powHash(gpa), self.bits)) return i;
+        }
+        return error.PowNotFound;
     }
 };
 
@@ -171,6 +205,24 @@ test "block id commits to header, is deterministic" {
     var h3 = h;
     h3.witness_root = [_]u8{0x11} ** 32;
     try testing.expect(!std.mem.eql(u8, &id1, &(try h3.id(gpa))));
+}
+
+test "proof-of-work: mine a header, validate it, reject at higher difficulty" {
+    const gpa = testing.allocator;
+    var hdr = BlockHeader{
+        .version = 1,
+        .parents = &.{},
+        .timestamp = 1,
+        .merkle_root = hashmod.zero,
+        .witness_root = hashmod.zero,
+        .bits = pow.easy_bits,
+    };
+    _ = try hdr.mine(gpa, 1_000_000); // finds a satisfying nonce
+    try testing.expect(try hdr.validatePow(gpa));
+
+    // At a far harder target the same header almost certainly fails.
+    hdr.bits = 0x1c00ffff; // target ~2^216, ~2^-40 pass probability
+    try testing.expect(!try hdr.validatePow(gpa));
 }
 
 test "witness commitment: verifies intact block, detects tampered witness" {

@@ -8,6 +8,8 @@
 const std = @import("std");
 const hashmod = @import("core/crypto/hash.zig");
 const prim = @import("core/primitives/types.zig");
+const blk = @import("core/primitives/block.zig");
+const powmod = @import("core/consensus/pow.zig");
 const utxo = @import("core/ledger/utxo.zig");
 const proc = @import("core/consensus/processor.zig");
 const Dag = @import("core/consensus/dag.zig").Dag;
@@ -168,6 +170,33 @@ pub fn main() !void {
         std.debug.print("  {s:<6} {d:>5}\n", .{ wlt.name, bal });
     }
     std.debug.print("  ----------\n  supply {d:>5}  (1000 genesis + 6x50 coinbase = 1300, conserved)\n", .{total});
+
+    // --- proof of work: actually mine each block header ---
+    std.debug.print("\nProof-of-work (mining each block header to its difficulty target):\n", .{});
+    const parent_sets = [_][]const Hash256{
+        &.{}, &.{h(1)}, &.{h(2)}, &.{h(2)}, &.{ h(3), h(4) }, &.{h(5)}, &.{h(6)},
+    };
+    var total_iters: u64 = 0;
+    for (blocks, 0..) |b, i| {
+        var hdr = blk.BlockHeader{
+            .version = 1,
+            .parents = parent_sets[i],
+            .timestamp = @intCast(1_700_000_000 + i),
+            .merkle_root = hashmod.zero,
+            .witness_root = hashmod.zero,
+            .bits = powmod.easy_bits,
+        };
+        const body = blk.Block{ .header = hdr, .txs = b.txs };
+        hdr.merkle_root = try body.computeMerkleRoot(gpa);
+        hdr.witness_root = try body.computeWitnessRoot(gpa);
+        const iters = try hdr.mine(gpa, 100_000_000);
+        total_iters += iters;
+        const ph = try hdr.powHash(gpa);
+        std.debug.print("  block h{d}  nonce={d:<4} powhash={s}...  valid={}\n", .{
+            i + 1, hdr.nonce, std.fmt.bytesToHex(ph, .lower)[0..12], try hdr.validatePow(gpa),
+        });
+    }
+    std.debug.print("  total hashes searched: {d}\n", .{total_iters});
 
     // --- finality ---
     var validators_kp: [4]Wallet = .{ Wallet.init("V0", 100), Wallet.init("V1", 101), Wallet.init("V2", 102), Wallet.init("V3", 103) };
