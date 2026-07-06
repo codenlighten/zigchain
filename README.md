@@ -24,9 +24,16 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 | Processor | `src/core/consensus/processor.zig` | Applies txs in GHOSTDAG order; deterministic cross-anticone double-spend resolution |
 
 ```
-zig build test --summary all      # 37/37 passing
+zig build test --summary all      # 45/45 passing
+zig build demo                    # full end-to-end chain run (see below)
 zig build sim                     # Phase-0 propagation feasibility table
 ```
+
+`zig build demo` mines a small BlockDAG of post-quantum-signed transactions
+(with a cross-fork double-spend), orders it with GHOSTDAG, applies it to the
+UTXO ledger, and finalizes a cut with a PQ-BFT validator set — printing the DAG,
+consensus order, double-spend resolution, conserved balances, and the finalized
+cut. It is a self-minting, ML-DSA-signed, DAG-ordered, BFT-finalized ledger.
 
 **Phase-0 propagation feasibility** (`src/sim/simnet.zig`) — a discrete-event
 gossip sim feeds real DAGs through the actual GHOSTDAG coloring and measures the

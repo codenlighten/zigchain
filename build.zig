@@ -36,4 +36,16 @@ pub fn build(b: *std.Build) void {
     const run_sim = b.addRunArtifact(sim_exe);
     const sim_step = b.step("sim", "Run the propagation simulation");
     sim_step.dependOn(&run_sim.step);
+
+    // `zig build demo` — full end-to-end chain run.
+    const demo_mod = b.createModule(.{
+        .root_source_file = b.path("src/demo_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const demo_exe = b.addExecutable(.{ .name = "zigchain-demo", .root_module = demo_mod });
+    b.installArtifact(demo_exe);
+    const run_demo = b.addRunArtifact(demo_exe);
+    const demo_step = b.step("demo", "Run the end-to-end chain demo");
+    demo_step.dependOn(&run_demo.step);
 }
