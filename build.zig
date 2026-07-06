@@ -98,4 +98,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_node.addArgs(args);
     const node_step = b.step("node", "Run a standalone networked node");
     node_step.dependOn(&run_node.step);
+
+    // `zig build license -- <keygen|issue|verify> ...` — the SmartLedger PQ
+    // software-license tool.
+    const license_mod = b.createModule(.{
+        .root_source_file = b.path("src/license_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const license_exe = b.addExecutable(.{ .name = "zigchain-license", .root_module = license_mod });
+    b.installArtifact(license_exe);
+    const run_license = b.addRunArtifact(license_exe);
+    if (b.args) |args| run_license.addArgs(args);
+    const license_step = b.step("license", "Issue/verify PQ software licenses");
+    license_step.dependOn(&run_license.step);
 }

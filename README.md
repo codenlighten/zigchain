@@ -56,6 +56,13 @@ docker build -t zigchain .
 docker run -d --restart unless-stopped -p 9000:9000 -v zigchain-data:/data -e ZIGCHAIN_MINE=true zigchain
 ```
 
+## Licensing
+
+Commercial use is gated by a **post-quantum, offline-verifiable license** (ML-DSA
+signed by SmartLedger; the node verifies it with no phone-home). See
+[`LICENSING.md`](LICENSING.md) for the pricing model and the `zig build license`
+issue/verify tool.
+
 ## Scale & fees (measured, `zig build bench`)
 
 Settlement-scale throughput with sub-penny fees is not a slogan here — it is

@@ -71,6 +71,11 @@ pub const Reader = struct {
         @memcpy(&h, s);
         return h;
     }
+
+    /// Read exactly `n` raw bytes, returning a slice into the buffer (no copy).
+    pub fn readN(self: *Reader, n: usize) ReadError![]const u8 {
+        return self.take(n);
+    }
     /// Returns a slice into the underlying buffer (no copy). Bounded by `max`.
     pub fn readVarBytes(self: *Reader, max: u32) ReadError![]const u8 {
         const n = try self.readU32();

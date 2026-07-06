@@ -19,6 +19,7 @@ const chain = @import("core/consensus/chain.zig");
 const blk = @import("core/primitives/block.zig");
 const hashmod = @import("core/crypto/hash.zig");
 const codec = @import("core/serialization/codec.zig");
+const lic = @import("licensing/license.zig");
 
 const Hash256 = hashmod.Hash256;
 const Block = blk.Block;
@@ -339,6 +340,66 @@ fn parsePeer(s: []const u8) ?PeerAddr {
     return .{ .ip = ip, .port = port };
 }
 
+fn realtimeSeconds() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
+fn readFileAlloc(gpa: std.mem.Allocator, path: [*:0]const u8) ?[]u8 {
+    const rc = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+    var list: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(fd, &buf) catch break;
+        if (n == 0) break;
+        list.appendSlice(gpa, buf[0..n]) catch return null;
+    }
+    return list.toOwnedSlice(gpa) catch null;
+}
+
+/// Verify a SmartLedger PQ software license. No license → community tier. A
+/// license that is present but invalid/expired → refuse to start (fail-closed).
+fn checkLicense(node: *Node, gpa: std.mem.Allocator, license_path: ?[]const u8, issuer_hex: ?[]const u8) void {
+    const path = license_path orelse {
+        node.log("no license supplied — running in community tier", .{});
+        return;
+    };
+    const ih = issuer_hex orelse {
+        node.log("license supplied but no --issuer-key to verify it; refusing to start", .{});
+        linux.exit(3);
+    };
+    const pubkey = gpa.alloc(u8, ih.len / 2) catch return;
+    _ = std.fmt.hexToBytes(pubkey, ih) catch {
+        node.log("bad --issuer-key hex; refusing to start", .{});
+        linux.exit(3);
+    };
+    const pathz = gpa.dupeZ(u8, path) catch return;
+    const data = readFileAlloc(gpa, pathz) orelse {
+        node.log("cannot read license file {s}; refusing to start", .{path});
+        linux.exit(3);
+    };
+    var r = codec.Reader{ .buf = data };
+    const token = lic.SignedLicense.decode(&r, gpa) catch {
+        node.log("malformed license file; refusing to start", .{});
+        linux.exit(3);
+    };
+    lic.verify(gpa, pubkey, token.license, token.signature, realtimeSeconds()) catch |e| {
+        node.log("LICENSE INVALID ({s}) — refusing to start", .{@errorName(e)});
+        linux.exit(3);
+    };
+    node.log("licensed to '{s}' (tier={d}, features=0x{x}, max_nodes={d}, expires={d})", .{
+        token.license.licensee,
+        @intFromEnum(token.license.tier),
+        token.license.features,
+        token.license.max_nodes,
+        token.license.expires_at,
+    });
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var args = std.process.Args.Iterator.init(init.minimal.args);
@@ -350,6 +411,8 @@ pub fn main(init: std.process.Init) !void {
     var name: []const u8 = "node";
     var serve_secs: u64 = 0;
     var datadir: ?[]const u8 = null;
+    var license_path: ?[]const u8 = null;
+    var issuer_hex: ?[]const u8 = null;
     var peer_addrs: std.ArrayList(PeerAddr) = .empty;
     defer peer_addrs.deinit(gpa);
 
@@ -368,11 +431,19 @@ pub fn main(init: std.process.Init) !void {
             serve_secs = std.fmt.parseInt(u64, args.next() orelse "0", 10) catch 0;
         } else if (std.mem.eql(u8, arg, "--datadir")) {
             datadir = args.next();
+        } else if (std.mem.eql(u8, arg, "--license")) {
+            license_path = args.next();
+        } else if (std.mem.eql(u8, arg, "--issuer-key")) {
+            issuer_hex = args.next();
         }
     }
 
     const node = try gpa.create(Node);
     node.* = .{ .gpa = gpa, .chain = chain.Chain.init(gpa, .{}), .name = name };
+
+    // Verify the SmartLedger software license (fail-closed if one is supplied
+    // but invalid; community tier if none is supplied).
+    checkLicense(node, gpa, license_path, issuer_hex);
 
     // Persistence: open the block log and replay it to rebuild the chain.
     if (datadir) |dir| {
