@@ -3,10 +3,12 @@
 //! 256-bit target arithmetic exact and painless.
 //!
 //! The PoW *hash function* is deliberately a separate concern from data hashing
-//! (see the plan): a production deployment picks an ASIC/centralisation-aware
-//! function (a Kaspa-style heavy-hash). For now `blockHeaderPowHash` funnels
-//! through the `.pow` domain so the function can be swapped in one place. Grover
-//! is a non-threat to PoW (≤ quadratic, absorbed by difficulty), so the 256-bit
+//! (see the plan): it is the ZigChain heavy-hash (kHeavyHash-lineage — a per-block
+//! matrix-vector product sandwiched between two `.pow`-domain hashes), which is
+//! more ASIC/GPU-balanced than plain hashing. See `heavyhash.zig`. This module
+//! owns only the difficulty *target* math (compact bits, target check, retarget);
+//! the heavy-hash itself lives next door and is swappable in one place. Grover is
+//! a non-threat to PoW (≤ quadratic, absorbed by difficulty), so the 256-bit
 //! search space is ample.
 
 const std = @import("std");

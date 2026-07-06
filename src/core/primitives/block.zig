@@ -11,6 +11,7 @@ const hashmod = @import("../crypto/hash.zig");
 const codec = @import("../serialization/codec.zig");
 const tx_mod = @import("types.zig");
 const pow = @import("../consensus/pow.zig");
+const heavyhash = @import("../consensus/heavyhash.zig");
 
 const Hash256 = hashmod.Hash256;
 const Transaction = tx_mod.Transaction;
@@ -76,14 +77,34 @@ pub const BlockHeader = struct {
         };
     }
 
-    /// The proof-of-work hash (separate domain from the block id, so the PoW
-    /// function can be swapped without touching identity hashing).
-    pub fn powHash(self: BlockHeader, gpa: std.mem.Allocator) !Hash256 {
+    /// The 32-byte encoding of this header (the message the PoW hash grinds).
+    fn encodeBytes(self: BlockHeader, gpa: std.mem.Allocator) ![]u8 {
         var list: std.ArrayList(u8) = .empty;
-        defer list.deinit(gpa);
+        errdefer list.deinit(gpa);
         var w = codec.Writer{ .list = &list, .gpa = gpa };
         try self.encode(&w);
-        return hashmod.hash(.pow, list.items);
+        return list.toOwnedSlice(gpa);
+    }
+
+    /// The per-block heavy-hash matrix seed: this header with the nonce zeroed,
+    /// hashed under the `.pow` domain. Fixed for the whole nonce search, so the
+    /// matrix is computed once and reused across nonces.
+    fn powSeed(self: BlockHeader, gpa: std.mem.Allocator) !Hash256 {
+        var pre = self;
+        pre.nonce = 0;
+        const bytes = try pre.encodeBytes(gpa);
+        defer gpa.free(bytes);
+        return hashmod.hash(.pow, bytes);
+    }
+
+    /// The proof-of-work hash: the ZigChain heavy-hash of the header under the
+    /// block's matrix. A separate domain from the block id, so the PoW function
+    /// is swappable without touching identity hashing.
+    pub fn powHash(self: BlockHeader, gpa: std.mem.Allocator) !Hash256 {
+        const seed = try self.powSeed(gpa);
+        const bytes = try self.encodeBytes(gpa);
+        defer gpa.free(bytes);
+        return heavyhash.heavyHash(seed, bytes);
     }
 
     /// Does this header satisfy its own difficulty target?
@@ -93,12 +114,18 @@ pub const BlockHeader = struct {
 
     /// Search for a nonce that satisfies `self.bits`, up to `max_iters`.
     /// Mutates `self.nonce`. Returns the number of iterations, or error on
-    /// exhaustion.
+    /// exhaustion. The matrix depends only on the nonce-free header, so it is
+    /// computed once and reused — the per-nonce cost is one re-encode + one
+    /// heavy-hash.
     pub fn mine(self: *BlockHeader, gpa: std.mem.Allocator, max_iters: u64) !u64 {
+        const seed = try self.powSeed(gpa);
+        var matrix = heavyhash.genMatrix(seed);
         var i: u64 = 0;
         while (i < max_iters) : (i += 1) {
             self.nonce = i;
-            if (pow.meetsTarget(try self.powHash(gpa), self.bits)) return i;
+            const bytes = try self.encodeBytes(gpa);
+            defer gpa.free(bytes);
+            if (pow.meetsTarget(heavyhash.heavyHashWithMatrix(&matrix, bytes), self.bits)) return i;
         }
         return error.PowNotFound;
     }

@@ -21,6 +21,7 @@ pub const processor = @import("core/consensus/processor.zig");
 pub const mass = @import("core/consensus/mass.zig");
 pub const finality = @import("core/consensus/finality.zig");
 pub const pow = @import("core/consensus/pow.zig");
+pub const heavyhash = @import("core/consensus/heavyhash.zig");
 pub const chain = @import("core/consensus/chain.zig");
 pub const ledger_state = @import("core/consensus/ledger_state.zig");
 pub const parallel = @import("core/consensus/parallel.zig");
@@ -48,6 +49,7 @@ test {
     _ = mass;
     _ = finality;
     _ = pow;
+    _ = heavyhash;
     _ = chain;
     _ = ledger_state;
     _ = parallel;

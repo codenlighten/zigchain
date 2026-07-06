@@ -11,6 +11,7 @@ const hashmod = @import("core/crypto/hash.zig");
 const prim = @import("core/primitives/types.zig");
 const pq = @import("core/crypto/pq/registry.zig");
 const blk = @import("core/primitives/block.zig");
+const heavyhash = @import("core/consensus/heavyhash.zig");
 const massmod = @import("core/consensus/mass.zig");
 const finality = @import("core/consensus/finality.zig");
 const Dag = @import("core/consensus/dag.zig").Dag;
@@ -139,6 +140,18 @@ pub fn main() !void {
             const pk = hexToBytes(gpa, field(av, "pubkey").string);
             const c = prim.addressCommitment(scheme, pk);
             out.line("addr {d} {s}\n", .{ i, std.fmt.bytesToHex(c, .lower) });
+        }
+    }
+
+    // --- heavy-hash PoW (matched byte-for-byte against the Rust reference) ---
+    {
+        var i: u32 = 0;
+        while (i < 4) : (i += 1) {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(u32, &b, i, .little);
+            const seed = hashmod.hash(.block_header, &b);
+            const data = hashmod.hash(.txid, &b);
+            out.line("heavyhash {d} {s}\n", .{ i, std.fmt.bytesToHex(heavyhash.heavyHash(seed, &data), .lower) });
         }
     }
 

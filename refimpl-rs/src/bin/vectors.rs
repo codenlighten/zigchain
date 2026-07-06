@@ -164,6 +164,14 @@ fn main() {
         println!("addr {i} {}", to_hex(&c));
     }
 
+    // Heavy-hash PoW: deterministic (seed, data) pairs, matched byte-for-byte
+    // against the Zig implementation.
+    for i in 0u32..4 {
+        let seed = tagged("block_header", &i.to_le_bytes());
+        let data = tagged("txid", &i.to_le_bytes());
+        println!("heavyhash {i} {}", to_hex(&heavy_hash(&seed, &data)));
+    }
+
     for (i, mv) in s.merkle_vectors.iter().enumerate() {
         let leaves: Vec<Hash> = mv.leaves.iter().map(|l| h32(l)).collect();
         println!("merkle {i} {}", to_hex(&merkle_root(&leaves)));

@@ -24,8 +24,66 @@ pub fn domain_ctx(name: &str) -> &'static str {
         "block_header" => "zigchain.v1.block.header",
         "witness" => "zigchain.v1.witness",
         "finality_vote" => "zigchain.v1.finality.vote",
+        "pow" => "zigchain.v1.pow",
         _ => panic!("unknown domain {name}"),
     }
+}
+
+// --- heavy-hash proof-of-work (kHeavyHash-lineage; see heavyhash.zig) ---
+
+const HH_N: usize = 64;
+
+pub fn gen_matrix(seed: &Hash) -> [[u8; HH_N]; HH_N] {
+    let mut m = [[0u8; HH_N]; HH_N];
+    let mut buf = [0u8; 36];
+    buf[..32].copy_from_slice(seed);
+    let mut k: usize = 0;
+    let mut counter: u32 = 0;
+    while k < HH_N * HH_N {
+        buf[32..36].copy_from_slice(&counter.to_le_bytes());
+        let block = tagged("pow", &buf);
+        for byte in block {
+            if k >= HH_N * HH_N {
+                break;
+            }
+            m[k / HH_N][k % HH_N] = byte >> 4;
+            k += 1;
+            if k >= HH_N * HH_N {
+                break;
+            }
+            m[k / HH_N][k % HH_N] = byte & 0x0F;
+            k += 1;
+        }
+        counter += 1;
+    }
+    m
+}
+
+pub fn heavy_hash_with_matrix(m: &[[u8; HH_N]; HH_N], data: &[u8]) -> Hash {
+    let h1 = tagged("pow", data);
+    let mut v = [0u8; HH_N];
+    for k in 0..32 {
+        v[2 * k] = h1[k] >> 4;
+        v[2 * k + 1] = h1[k] & 0x0F;
+    }
+    let mut p = [0u8; HH_N];
+    for i in 0..HH_N {
+        let mut sum: u32 = 0;
+        for j in 0..HH_N {
+            sum += (m[i][j] as u32) * (v[j] as u32);
+        }
+        p[i] = ((sum >> 10) & 0x0F) as u8;
+    }
+    let mut mixed = [0u8; 32];
+    for k in 0..32 {
+        mixed[k] = h1[k] ^ ((p[2 * k] << 4) | p[2 * k + 1]);
+    }
+    tagged("pow", &mixed)
+}
+
+pub fn heavy_hash(seed: &Hash, data: &[u8]) -> Hash {
+    let m = gen_matrix(seed);
+    heavy_hash_with_matrix(&m, data)
 }
 
 /// BIP340-style tagged hash: prime the state with H(tag) twice, then the message.
