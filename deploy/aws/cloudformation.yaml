@@ -1,9 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   ZigChain node — single-click deploy. Launches an EC2 instance that builds the
-  node from source into a container and runs it as a self-restarting service,
-  with a persistent block log. Mine a fresh chain, or join an existing network
-  by pointing SeedPeer at a running node.
+  node from source into a container and runs it as a self-restarting service.
+  The block log lives on a SEPARATE, retained EBS volume, so the chain survives
+  instance termination. Mine a fresh chain, or join an existing network by
+  pointing SeedPeer at a running node.
 
 Parameters:
   InstanceType:
@@ -38,9 +39,14 @@ Parameters:
     Description: CIDR allowed to SSH (only used if a key pair is given). Restrict this.
   RootVolumeSizeGb:
     Type: Number
-    Default: 20
+    Default: 12
     MinValue: 8
-    Description: Root EBS volume size (holds the block log).
+    Description: Root EBS volume (OS + container image).
+  DataVolumeSizeGb:
+    Type: Number
+    Default: 20
+    MinValue: 4
+    Description: Retained EBS volume that holds the block log.
 
 Conditions:
   HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
@@ -80,24 +86,68 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -euxo pipefail
+          # No -e: a data-volume mount failure should fall back, not abort boot.
+          set -uxo pipefail
           dnf update -y
           dnf install -y docker git
           systemctl enable --now docker
+
+          DATADIR=/var/lib/zigchain
+          mkdir -p "$DATADIR"
+
+          # Mount the retained EBS data volume. On Nitro it appears as an extra
+          # NVMe disk with no partitions/filesystem; wait for it to attach, then
+          # format on first boot and mount. If it never appears, we fall through
+          # and the block log simply lives on the root volume.
+          DATA_DEV=""
+          for _ in $(seq 1 40); do
+            for d in $(lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print $1}'); do
+              dev="/dev/$d"
+              if lsblk -no MOUNTPOINTS "$dev" 2>/dev/null | grep -q '[^[:space:]]'; then continue; fi
+              DATA_DEV="$dev"
+            done
+            [ -n "$DATA_DEV" ] && break
+            sleep 5
+          done
+          if [ -n "$DATA_DEV" ]; then
+            if ! blkid "$DATA_DEV" >/dev/null 2>&1; then mkfs.ext4 -F "$DATA_DEV"; fi
+            UUID=$(blkid -s UUID -o value "$DATA_DEV")
+            grep -q "$UUID" /etc/fstab || echo "UUID=$UUID $DATADIR ext4 defaults,nofail 0 2" >> /etc/fstab
+            mount -a || true
+          fi
+
           cd /root
           git clone https://github.com/codenlighten/zigchain.git
           cd zigchain
           docker build -t zigchain .
-          docker volume create zigchain-data
           docker run -d --name zigchain --restart unless-stopped \
             -p ${P2PPort}:${P2PPort} \
-            -v zigchain-data:/data \
+            -v "$DATADIR":/data \
             -e ZIGCHAIN_PORT=${P2PPort} \
             -e ZIGCHAIN_MINE=${Mine} \
             -e ZIGCHAIN_PEER=${SeedPeer} \
             zigchain
-          # Log the container's status for `aws ec2 get-console-output`.
           sleep 5 && docker logs zigchain || true
+
+  # A separate volume with Retain so the chain survives instance/stack teardown.
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Size: !Ref DataVolumeSizeGb
+      VolumeType: gp3
+      AvailabilityZone: !GetAtt Node.AvailabilityZone
+      Tags:
+        - Key: Name
+          Value: zigchain-data
+
+  DataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref Node
+      VolumeId: !Ref DataVolume
 
 Outputs:
   PublicIp:
@@ -109,6 +159,9 @@ Outputs:
   JoinCommand:
     Description: How another node joins this one.
     Value: !Sub "zig build node -- --peer ${Node.PublicIp}:${P2PPort}"
+  DataVolumeId:
+    Description: Retained EBS volume holding the block log (survives teardown).
+    Value: !Ref DataVolume
   SSHCommand:
     Condition: HasKeyName
     Description: SSH to the instance (then `docker logs -f zigchain`).

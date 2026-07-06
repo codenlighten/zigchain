@@ -66,19 +66,27 @@ Environment variables (see `deploy/docker-entrypoint.sh`):
 
 - An EC2 instance (Amazon Linux 2023) running the node in Docker with
   `--restart unless-stopped` (survives crashes and reboots).
-- A `gp3` root volume holding the block log — the node also replays it on
-  restart, and can re-sync from peers if lost.
+- A **separate, retained** `gp3` EBS volume (`DeletionPolicy: Retain`) mounted at
+  `/var/lib/zigchain` for the block log, so the chain **survives instance and
+  stack teardown** (and the node also re-syncs from peers, and replays the log
+  on restart — defence in depth). If the volume can't be mounted, boot falls
+  back to the root volume rather than failing.
 - A security group opening the P2P port to the internet (and SSH only if you
   pass a key pair).
+
+The deployed node is built in **ReleaseSafe** (`-Dnode-safe=true` in the
+`Dockerfile`) — integer-overflow and bounds checks trap deterministically, which
+matters for code validating untrusted network input.
 
 ## Production notes
 
 - **Restrict `SSHLocation`** to your own IP, and pass a `KeyName` only if you
   need shell access.
-- For durability across instance *termination*, attach a **separate EBS volume**
-  with `DeletionPolicy: Retain` and mount it at `/data` (the node's chain also
-  re-syncs from peers, so this is defence-in-depth).
 - The image pins the exact Zig toolchain (`Dockerfile` `ARG ZIG_VERSION`) from a
   durable mirror, so builds are reproducible.
-- Consider building the node in `ReleaseSafe` (integer-overflow / bounds traps
-  kept on) for consensus-critical deployments.
+- The retained data volume keeps the chain after teardown; delete it by hand
+  (or via its `DataVolumeId` output) when you truly want to discard the chain.
+- **Caveat:** the EBS mount logic follows AWS/Nitro best practice (wait for the
+  device, format on first boot, `nofail` fstab entry) but has been validated for
+  template structure only, not against a live instance. Do a test launch in a
+  throwaway account before relying on it.
