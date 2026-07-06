@@ -31,11 +31,15 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 | Networking | `src/net/wire.zig` | Length-framed P2P gossip (inv/get_block/block) over raw sockets; block wire codec; real TCP connect/listen |
 
 ```
-zig build test --summary all      # 62/62 passing
+zig build test --summary all      # 76/76 passing
 zig build demo                    # full end-to-end chain run (see below)
 zig build bench                   # measured scaling / sub-penny-fee numbers
 zig build sim                     # Phase-0 propagation feasibility table
 ./tools/difftest.sh               # Zig vs Rust differential conformance
+
+# Run a real network of node processes that peer over TCP and converge:
+zig build node -- --port 9101 --name B --blocks 5              # in one terminal
+zig build node -- --port 9100 --peer 127.0.0.1:9101 --mine --blocks 5 --name A
 ```
 
 ## Scale & fees (measured, `zig build bench`)

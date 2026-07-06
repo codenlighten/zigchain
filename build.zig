@@ -74,4 +74,19 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run the scaling benchmark");
     bench_step.dependOn(&run_bench.step);
+
+    // `zig build node -- <args>` — a standalone networked node process.
+    const node_mod = b.createModule(.{
+        .root_source_file = b.path("src/node_main.zig"),
+        .target = target,
+        // ReleaseFast: uses the thread-safe smp allocator (no debug leak-tracking
+        // noise; the node intentionally persists block memory for the chain).
+        .optimize = .ReleaseFast,
+    });
+    const node_exe = b.addExecutable(.{ .name = "zigchain-node", .root_module = node_mod });
+    b.installArtifact(node_exe);
+    const run_node = b.addRunArtifact(node_exe);
+    if (b.args) |args| run_node.addArgs(args);
+    const node_step = b.step("node", "Run a standalone networked node");
+    node_step.dependOn(&run_node.step);
 }
