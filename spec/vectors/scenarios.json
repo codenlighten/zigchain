@@ -1,0 +1,318 @@
+{
+  "tx_vectors": [
+    {
+      "version": 1,
+      "inputs": [
+        {
+          "txid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "value": 1000,
+          "scheme": 1,
+          "commitment": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "witnesses": [
+        {
+          "scheme": 1,
+          "pubkey": "01020304",
+          "signature": "05060708"
+        }
+      ],
+      "payload": "",
+      "sighash_scheme": 1
+    },
+    {
+      "version": 7,
+      "inputs": [
+        {
+          "txid": "1111111111111111111111111111111111111111111111111111111111111111",
+          "index": 3
+        },
+        {
+          "txid": "2222222222222222222222222222222222222222222222222222222222222222",
+          "index": 0
+        }
+      ],
+      "outputs": [
+        {
+          "value": 500,
+          "scheme": 1,
+          "commitment": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        {
+          "value": 499,
+          "scheme": 2,
+          "commitment": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        }
+      ],
+      "witnesses": [
+        {
+          "scheme": 1,
+          "pubkey": "aabb",
+          "signature": "ccdd"
+        },
+        {
+          "scheme": 2,
+          "pubkey": "eeff",
+          "signature": "0011"
+        }
+      ],
+      "payload": "deadbeef",
+      "sighash_scheme": 2
+    },
+    {
+      "version": 1,
+      "inputs": [],
+      "outputs": [
+        {
+          "value": 50,
+          "scheme": 1,
+          "commitment": "9999999999999999999999999999999999999999999999999999999999999999"
+        }
+      ],
+      "witnesses": [],
+      "payload": "0000000000000000",
+      "sighash_scheme": 1
+    }
+  ],
+  "address_vectors": [
+    {
+      "scheme": 1,
+      "pubkey": "deadbeef"
+    },
+    {
+      "scheme": 3,
+      "pubkey": "00"
+    },
+    {
+      "scheme": 2,
+      "pubkey": ""
+    }
+  ],
+  "merkle_vectors": [
+    {
+      "leaves": []
+    },
+    {
+      "leaves": [
+        "1111111111111111111111111111111111111111111111111111111111111111"
+      ]
+    },
+    {
+      "leaves": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      ]
+    },
+    {
+      "leaves": [
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+        "0404040404040404040404040404040404040404040404040404040404040404"
+      ]
+    }
+  ],
+  "dag_scenarios": [
+    {
+      "name": "linear6",
+      "k": 3,
+      "blocks": [
+        {
+          "id": 1,
+          "parents": []
+        },
+        {
+          "id": 2,
+          "parents": [
+            1
+          ]
+        },
+        {
+          "id": 3,
+          "parents": [
+            2
+          ]
+        },
+        {
+          "id": 4,
+          "parents": [
+            3
+          ]
+        },
+        {
+          "id": 5,
+          "parents": [
+            4
+          ]
+        },
+        {
+          "id": 6,
+          "parents": [
+            5
+          ]
+        }
+      ]
+    },
+    {
+      "name": "diamond_k1",
+      "k": 1,
+      "blocks": [
+        {
+          "id": 1,
+          "parents": []
+        },
+        {
+          "id": 2,
+          "parents": [
+            1
+          ]
+        },
+        {
+          "id": 3,
+          "parents": [
+            1
+          ]
+        },
+        {
+          "id": 4,
+          "parents": [
+            2,
+            3
+          ]
+        }
+      ]
+    },
+    {
+      "name": "diamond_k0",
+      "k": 0,
+      "blocks": [
+        {
+          "id": 1,
+          "parents": []
+        },
+        {
+          "id": 2,
+          "parents": [
+            1
+          ]
+        },
+        {
+          "id": 3,
+          "parents": [
+            1
+          ]
+        },
+        {
+          "id": 4,
+          "parents": [
+            2,
+            3
+          ]
+        }
+      ]
+    },
+    {
+      "name": "demo_fork",
+      "k": 3,
+      "blocks": [
+        {
+          "id": 1,
+          "parents": []
+        },
+        {
+          "id": 2,
+          "parents": [
+            1
+          ]
+        },
+        {
+          "id": 3,
+          "parents": [
+            2
+          ]
+        },
+        {
+          "id": 4,
+          "parents": [
+            2
+          ]
+        },
+        {
+          "id": 5,
+          "parents": [
+            3,
+            4
+          ]
+        },
+        {
+          "id": 6,
+          "parents": [
+            5
+          ]
+        },
+        {
+          "id": 7,
+          "parents": [
+            6
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wide",
+      "k": 2,
+      "blocks": [
+        {
+          "id": 1,
+          "parents": []
+        },
+        {
+          "id": 2,
+          "parents": [
+            1
+          ]
+        },
+        {
+          "id": 3,
+          "parents": [
+            1
+          ]
+        },
+        {
+          "id": 4,
+          "parents": [
+            1
+          ]
+        },
+        {
+          "id": 5,
+          "parents": [
+            2,
+            3,
+            4
+          ]
+        },
+        {
+          "id": 6,
+          "parents": [
+            2,
+            4
+          ]
+        },
+        {
+          "id": 7,
+          "parents": [
+            5,
+            6
+          ]
+        }
+      ]
+    }
+  ]
+}

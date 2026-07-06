@@ -2,3 +2,6 @@
 zig-out/
 *.o
 *.a
+
+# Rust reference implementation build artifacts
+refimpl-rs/target/

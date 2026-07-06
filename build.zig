@@ -48,4 +48,18 @@ pub fn build(b: *std.Build) void {
     const run_demo = b.addRunArtifact(demo_exe);
     const demo_step = b.step("demo", "Run the end-to-end chain demo");
     demo_step.dependOn(&run_demo.step);
+
+    // `zig build vectors -- <scenarios.json>` — differential test report.
+    const vectors_mod = b.createModule(.{
+        .root_source_file = b.path("src/vectors_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vectors_mod.addAnonymousImport("scenarios_json", .{ .root_source_file = b.path("spec/vectors/scenarios.json") });
+    const vectors_exe = b.addExecutable(.{ .name = "zigchain-vectors", .root_module = vectors_mod });
+    b.installArtifact(vectors_exe);
+    const run_vectors = b.addRunArtifact(vectors_exe);
+    if (b.args) |args| run_vectors.addArgs(args);
+    const vectors_step = b.step("vectors", "Emit the differential-test vector report");
+    vectors_step.dependOn(&run_vectors.step);
 }

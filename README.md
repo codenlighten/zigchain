@@ -27,7 +27,17 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 zig build test --summary all      # 45/45 passing
 zig build demo                    # full end-to-end chain run (see below)
 zig build sim                     # Phase-0 propagation feasibility table
+./tools/difftest.sh               # Zig vs Rust differential conformance
 ```
+
+**Differential testing against an independent Rust implementation.** `refimpl-rs/`
+reimplements the consensus-critical, byte-exact rules (tagged hashing, canonical
+serialization, txid/wtxid/sighash/address/merkle, GHOSTDAG coloring + ordering)
+from the specs — not ported line-by-line — so agreement is real evidence of
+correctness, not a shared bug. Both read `spec/vectors/scenarios.json` and emit a
+canonical report; `tools/difftest.sh` confirms they agree **byte-for-byte** (54
+report lines across transactions, addresses, merkle roots, and 5 DAG scenarios).
+Any divergence is a consensus split, caught before it ships.
 
 `zig build demo` mines a small BlockDAG of post-quantum-signed transactions
 (with a cross-fork double-spend), orders it with GHOSTDAG, applies it to the
