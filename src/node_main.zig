@@ -51,11 +51,14 @@ fn sleepMs(ms: u64) void {
 const max_peers: usize = 128;
 const max_orphans: usize = 8192;
 const max_book: usize = 1024; // known-peer address book cap
-// Per-peer message rate: a 512-message burst, refilling ~500/s. Enough for a
-// sync flood of blocks, but a peer that sustains more is dropped.
+// Per-peer message rate: a 512-message burst, refilling ~500/s. An over-budget
+// message is DROPPED (not processed), which throttles a flood without aborting a
+// legitimate sync; only sustained flooding (many consecutive drops) disconnects.
 const rate_burst: u32 = 512;
 const rate_refill_ms: u32 = 2;
+const max_drop_strikes: u32 = 4096; // consecutive rate-limited drops before disconnect
 const discovery_interval_ms: u64 = 2000;
+const dial_cooldown_ms: u64 = 30_000; // minimum interval between dial attempts to one address
 
 const NetAddr = wire.NetAddr;
 
@@ -63,15 +66,34 @@ fn nowMs() u64 {
     return nowNs() / 1_000_000;
 }
 
-fn containsAddr(list: []const NetAddr, a: NetAddr) bool {
-    for (list) |x| if (x.eql(a)) return true;
-    return false;
+/// Pack an address into a hashable key (IPv4 big-endian in the high 32 bits).
+fn packAddr(a: NetAddr) u64 {
+    return (@as(u64, std.mem.readInt(u32, &a.ip, .big)) << 16) | a.port;
 }
 
 const Peer = struct {
     fd: i32,
+    ip: [4]u8,
     send: SpinLock = .{},
     limiter: ratelimit.RateLimiter,
+    /// The peer's advertised dial address, once its hello is seen (guarded by node.lock).
+    listen_addr: ?NetAddr = null,
+    drop_strikes: u32 = 0, // consecutive rate-limited drops (handleConn thread only)
+    /// Reference count: the peer list holds one; broadcastBlock takes one while
+    /// sending. The fd is closed and the struct freed when it drops to zero, so a
+    /// peer can be removed from the list without a use-after-free in a concurrent
+    /// broadcast.
+    rc: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+    fn retain(self: *Peer) void {
+        _ = self.rc.fetchAdd(1, .monotonic);
+    }
+    fn release(self: *Peer, gpa: std.mem.Allocator) void {
+        if (self.rc.fetchSub(1, .acq_rel) == 1) {
+            _ = linux.close(self.fd);
+            gpa.destroy(self);
+        }
+    }
 };
 
 /// A block received before its parents — held until they arrive.
@@ -87,10 +109,13 @@ const Node = struct {
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     name: []const u8,
     // Peer discovery (PEX). `book` is the set of known dial addresses; `dialed`
-    // records addresses we've already reached out to. Both guarded by `lock`.
+    // maps a packed address to the last dial-attempt time (a cooldown, so a
+    // transient failure is retried later rather than blacklisted forever). Both
+    // guarded by `lock`. `self_nonce` is echoed in hello to detect self-connections.
     listen_port: u16 = 0,
+    self_nonce: u64 = 0,
     book: addrbook.AddressBook = undefined,
-    dialed: std.ArrayList(NetAddr) = .empty,
+    dialed: std.AutoHashMapUnmanaged(u64, u64) = .empty,
 
     fn log(self: *Node, comptime fmt: []const u8, args: anytype) void {
         std.debug.print("[{s}] " ++ fmt ++ "\n", .{self.name} ++ args);
@@ -103,7 +128,7 @@ const Node = struct {
     }
 };
 
-fn addPeer(node: *Node, fd: i32) void {
+fn addPeer(node: *Node, fd: i32, ip: [4]u8, listen_addr: ?NetAddr) void {
     node.lock.lock();
     const full = node.peers.items.len >= max_peers;
     node.lock.unlock();
@@ -116,11 +141,42 @@ fn addPeer(node: *Node, fd: i32) void {
         _ = linux.close(fd);
         return;
     };
-    peer.* = .{ .fd = fd, .limiter = ratelimit.RateLimiter.init(rate_burst, rate_refill_ms, nowMs()) };
+    peer.* = .{
+        .fd = fd,
+        .ip = ip,
+        .listen_addr = listen_addr,
+        .limiter = ratelimit.RateLimiter.init(rate_burst, rate_refill_ms, nowMs()),
+    };
     node.lock.lock();
     node.peers.append(node.gpa, peer) catch {};
     node.lock.unlock();
     _ = std.Thread.spawn(.{}, handleConn, .{ node, peer }) catch {};
+}
+
+/// Remove a peer from the active list and drop the list's reference. The fd is
+/// closed and the struct freed only once the last reference (e.g. an in-flight
+/// broadcast) is gone.
+fn removePeer(node: *Node, peer: *Peer) void {
+    node.lock.lock();
+    for (node.peers.items, 0..) |p, i| {
+        if (p == peer) {
+            _ = node.peers.swapRemove(i);
+            break;
+        }
+    }
+    node.lock.unlock();
+    peer.release(node.gpa);
+}
+
+/// Are we already connected to a node that advertised dial address `a`? Caller
+/// must hold node.lock.
+fn connectedToLocked(node: *Node, a: NetAddr) bool {
+    for (node.peers.items) |p| {
+        if (p.listen_addr) |la| {
+            if (la.eql(a)) return true;
+        }
+    }
+    return false;
 }
 
 /// Send an encoded block to every peer except `except_fd`.
@@ -130,9 +186,11 @@ fn broadcastBlock(node: *Node, bytes: []const u8, except_fd: i32) void {
         node.lock.unlock();
         return;
     };
+    for (snapshot) |p| p.retain(); // keep peers alive for the send, even if removed concurrently
     node.lock.unlock();
     defer node.gpa.free(snapshot);
     for (snapshot) |p| {
+        defer p.release(node.gpa);
         if (p.fd == except_fd) continue;
         p.send.lock();
         wire.sendMessage(p.fd, node.gpa, .{ .block = bytes }) catch {};
@@ -166,23 +224,34 @@ fn sendAddrs(node: *Node, peer: *Peer) void {
 }
 
 fn handleConn(node: *Node, peer: *Peer) void {
-    // Introduce ourselves (advertising our listen port) and ask for peers.
-    sendOne(node, peer, .{ .hello = .{ .version = 1, .listen_port = node.listen_port } });
+    defer removePeer(node, peer); // always close the fd and free the peer on exit
+
+    // Introduce ourselves (version, listen port, self nonce) and ask for peers.
+    sendOne(node, peer, .{ .hello = .{ .version = 1, .listen_port = node.listen_port, .nonce = node.self_nonce } });
     sendOne(node, peer, .getaddr);
     sendTipInv(node, peer); // let a joining peer start pulling history
     while (!node.stop.load(.acquire)) {
         const r = wire.recvMessage(peer.fd, node.gpa) catch break;
         defer node.gpa.free(r.buffer);
-        // Rate-limit: a peer that floods faster than the bucket refills is dropped.
+        // Rate-limit: an over-budget message is DROPPED (not processed), which
+        // throttles a flood without aborting a legitimate sync burst. Only a peer
+        // that sustains the flood past `max_drop_strikes` is disconnected.
         if (!peer.limiter.allow(nowMs())) {
-            node.log("peer exceeded message rate limit; disconnecting", .{});
-            break;
+            peer.drop_strikes += 1;
+            if (peer.drop_strikes > max_drop_strikes) {
+                node.log("peer sustained flooding; disconnecting", .{});
+                break;
+            }
+            continue;
         }
+        peer.drop_strikes = 0;
         switch (r.msg) {
             .hello => |h| {
+                if (h.nonce != 0 and h.nonce == node.self_nonce) break; // connected to ourselves
                 // Learn the peer's real dial address: its source IP + advertised port.
-                const a = NetAddr{ .ip = wire.peerIp(peer.fd), .port = h.listen_port };
+                const a = NetAddr{ .ip = peer.ip, .port = h.listen_port };
                 node.lock.lock();
+                peer.listen_addr = a;
                 _ = node.book.add(a);
                 node.lock.unlock();
             },
@@ -338,7 +407,7 @@ fn listen(node: *Node, port: u16) void {
     while (!node.stop.load(.acquire)) {
         const fd = wire.tcpAccept(l) catch break;
         node.log("peer connected (inbound)", .{});
-        addPeer(node, fd);
+        addPeer(node, fd, wire.peerIp(fd), null); // inbound: dial address learned from its hello
     }
 }
 
@@ -349,21 +418,25 @@ fn discover(node: *Node) void {
         sleepMs(discovery_interval_ms);
         var targets: [8]NetAddr = undefined;
         var nt: usize = 0;
+        const now = nowMs();
         node.lock.lock();
         if (node.peers.items.len < max_peers) {
             for (node.book.items()) |a| {
                 if (nt >= targets.len) break;
-                if (containsAddr(node.dialed.items, a)) continue;
+                if (connectedToLocked(node, a)) continue; // already connected — no duplicate link
+                if (node.dialed.get(packAddr(a))) |last| {
+                    if (now - last < dial_cooldown_ms) continue; // dialed recently; back off
+                }
+                node.dialed.put(node.gpa, packAddr(a), now) catch {};
                 targets[nt] = a;
                 nt += 1;
             }
-            for (targets[0..nt]) |a| node.dialed.append(node.gpa, a) catch {};
         }
         node.lock.unlock();
         for (targets[0..nt]) |a| {
             const fd = wire.tcpConnect(a.ip, a.port) catch continue;
             node.log("discovered peer {d}.{d}.{d}.{d}:{d}", .{ a.ip[0], a.ip[1], a.ip[2], a.ip[3], a.port });
-            addPeer(node, fd);
+            addPeer(node, fd, a.ip, a); // outbound: dial address is the listen address
         }
     }
 }
@@ -540,13 +613,16 @@ pub fn main(init: std.process.Init) !void {
         node.store = s;
     }
 
-    // Peer discovery state: our own listen address (for self-exclusion) and the
-    // address book seeded with the configured --peer addresses.
+    // Peer discovery state: a per-process nonce (self-connection detection), the
+    // loopback self address (a cheap first-line self filter), and the address
+    // book seeded with the configured --peer addresses.
     node.listen_port = port;
+    node.self_nonce = nowNs() ^ (@as(u64, @intCast(linux.getpid())) << 32) ^ (@as(u64, port) << 16);
     node.book = addrbook.AddressBook.init(gpa, .{ .ip = .{ 127, 0, 0, 1 }, .port = port }, max_book);
+    const now_ms = nowMs();
     for (peer_addrs.items) |pa| {
         _ = node.book.add(pa);
-        node.dialed.append(gpa, pa) catch {}; // dialed explicitly below; don't re-dial
+        node.dialed.put(gpa, packAddr(pa), now_ms) catch {}; // dialed explicitly below
     }
 
     if (port > 0) _ = try std.Thread.spawn(.{}, listen, .{ node, port });
@@ -558,7 +634,7 @@ pub fn main(init: std.process.Init) !void {
             continue;
         };
         node.log("connected to peer (outbound)", .{});
-        addPeer(node, fd);
+        addPeer(node, fd, pa.ip, pa); // outbound: dial address is the listen address
     }
 
     // Discover further peers via PEX (needs a listener so discovered peers can

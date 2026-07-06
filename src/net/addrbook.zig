@@ -28,10 +28,23 @@ pub const AddressBook = struct {
         return false;
     }
 
+    /// A unicast IPv4 we'd be willing to dial. Rejects the wildcard, link-local,
+    /// broadcast, and multicast/reserved ranges so a peer (or a failed
+    /// getpeername returning 0.0.0.0) cannot poison the book. Loopback is allowed
+    /// so local testnets work; connecting to our own node is caught separately by
+    /// the hello nonce.
+    pub fn routable(ip: [4]u8) bool {
+        if (ip[0] == 0) return false; // 0.0.0.0/8 (incl. the getpeername-failure sentinel)
+        if (ip[0] == 169 and ip[1] == 254) return false; // link-local
+        if (ip[0] >= 224) return false; // multicast (224+), reserved (240+), 255.255.255.255
+        return true;
+    }
+
     /// Record a peer address. Returns true if it was newly added. Ignores our own
-    /// address, duplicates, and anything past the cap.
+    /// address, duplicates, unroutable addresses, and anything past the cap.
     pub fn add(self: *AddressBook, a: NetAddr) bool {
         if (a.port == 0) return false;
+        if (!routable(a.ip)) return false;
         if (a.eql(self.self_addr)) return false;
         if (self.contains(a)) return false;
         if (self.addrs.items.len >= self.cap) return false;
@@ -63,4 +76,17 @@ test "address book dedups, refuses self, and caps" {
     try testing.expect(!book.add(.{ .ip = .{ 127, 0, 0, 1 }, .port = 9004 }));
     try testing.expectEqual(@as(usize, 3), book.items().len);
     try testing.expect(book.contains(a));
+}
+
+test "unroutable addresses are rejected (0.0.0.0 poison, link-local, broadcast, multicast)" {
+    var book = AddressBook.init(testing.allocator, .{ .ip = .{ 10, 0, 0, 1 }, .port = 9000 }, 100);
+    defer book.deinit();
+    try testing.expect(!book.add(.{ .ip = .{ 0, 0, 0, 0 }, .port = 9001 })); // getpeername failure
+    try testing.expect(!book.add(.{ .ip = .{ 169, 254, 1, 1 }, .port = 9001 })); // link-local
+    try testing.expect(!book.add(.{ .ip = .{ 255, 255, 255, 255 }, .port = 9001 })); // broadcast
+    try testing.expect(!book.add(.{ .ip = .{ 224, 0, 0, 1 }, .port = 9001 })); // multicast
+    // Loopback and routable unicast are accepted.
+    try testing.expect(book.add(.{ .ip = .{ 127, 0, 0, 1 }, .port = 9001 }));
+    try testing.expect(book.add(.{ .ip = .{ 203, 0, 113, 5 }, .port = 9001 }));
+    try testing.expectEqual(@as(usize, 2), book.items().len);
 }

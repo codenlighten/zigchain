@@ -57,10 +57,12 @@ pub const NetAddr = struct {
     }
 };
 
-/// hello advertises the sender's protocol version AND its listen port, so a node
-/// that accepted the connection (and thus sees only an ephemeral source port) can
-/// still learn the peer's real dial address for peer exchange.
-pub const Hello = struct { version: u32, listen_port: u16 };
+/// hello advertises the sender's protocol version, its listen port (so a node
+/// that accepted the connection — seeing only an ephemeral source port — can
+/// still learn the peer's real dial address), and a per-process random nonce.
+/// A node that receives its own nonce knows it has connected to itself, which is
+/// how self-connections are detected regardless of address.
+pub const Hello = struct { version: u32, listen_port: u16, nonce: u64 = 0 };
 
 pub const max_addrs_per_msg: usize = 64;
 
@@ -79,9 +81,10 @@ pub fn sendMessage(fd: i32, gpa: std.mem.Allocator, msg: Message) Error!void {
     try payload.append(gpa, @intFromEnum(std.meta.activeTag(msg)));
     switch (msg) {
         .hello => |h| {
-            var b: [6]u8 = undefined;
+            var b: [14]u8 = undefined;
             std.mem.writeInt(u32, b[0..4], h.version, .little);
             std.mem.writeInt(u16, b[4..6], h.listen_port, .little);
+            std.mem.writeInt(u64, b[6..14], h.nonce, .little);
             try payload.appendSlice(gpa, &b);
         },
         .inv, .get_block => |id| try payload.appendSlice(gpa, &id),
@@ -115,6 +118,7 @@ pub fn recvMessage(fd: i32, gpa: std.mem.Allocator) Error!Recv {
         1 => .{ .hello = .{
             .version = if (data.len >= 4) std.mem.readInt(u32, data[0..4], .little) else 0,
             .listen_port = if (data.len >= 6) std.mem.readInt(u16, data[4..6], .little) else 0,
+            .nonce = if (data.len >= 14) std.mem.readInt(u64, data[6..14], .little) else 0,
         } },
         2, 3 => msg: {
             if (data.len < 32) return Error.BadFrame;
