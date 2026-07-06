@@ -90,6 +90,16 @@ pub const Transaction = struct {
     inputs: []const Input,
     outputs: []const Output,
     witnesses: []const Witness,
+    /// Free-form committed data. A coinbase (input-less) transaction MUST carry
+    /// the block height here so that two coinbases with identical outputs still
+    /// have distinct txids (otherwise their created outpoints would collide).
+    payload: []const u8 = &.{},
+
+    /// A coinbase mints new supply: it has no inputs (and therefore no
+    /// witnesses). Its value is bounded by the block subsidy at block level.
+    pub fn isCoinbase(self: Transaction) bool {
+        return self.inputs.len == 0;
+    }
 
     /// Witness-free body — the preimage the txid commits to.
     pub fn encodeBody(self: Transaction, w: *codec.Writer) !void {
@@ -98,6 +108,7 @@ pub const Transaction = struct {
         for (self.inputs) |in| try in.encode(w);
         try w.writeU32(@intCast(self.outputs.len));
         for (self.outputs) |out| try out.encode(w);
+        try w.writeVarBytes(self.payload);
     }
 
     pub fn encodeWitnesses(self: Transaction, w: *codec.Writer) !void {
@@ -185,6 +196,7 @@ test "transaction body/witness round-trips and txid ignores witnesses" {
     try testing.expectEqual(@as(u32, 1), try r.readU32()); // output count
     const out = try Output.decode(&r);
     try testing.expectEqual(@as(u64, 42), out.value);
+    try testing.expectEqualStrings("", try r.readVarBytes(max_pubkey_len)); // empty payload
     try r.finish();
 
     // Changing only a witness must NOT change the txid.

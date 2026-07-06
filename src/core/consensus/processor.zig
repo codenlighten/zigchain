@@ -58,6 +58,13 @@ pub fn applyOrder(
     for (order) |id| {
         const txs = by_id.get(id) orelse continue; // block carries no txs
         for (txs) |tx| {
+            if (tx.isCoinbase()) {
+                // Newly-minted supply. Its subsidy bound is checked by stateless
+                // block validation; here we just create its outputs.
+                try val.connectTx(set, tx, gpa);
+                stats.applied += 1;
+                continue;
+            }
             _ = val.validateTx(set, tx, gpa) catch {
                 stats.rejected += 1;
                 continue;
@@ -170,4 +177,66 @@ test "cross-anticone double-spend resolves to a single deterministic winner" {
     // The coin is spent exactly once; ledger has: Bob's output only.
     try testing.expect(!set.contains(funding));
     try testing.expectEqual(@as(usize, 1), set.count());
+}
+
+test "self-contained chain: coinbase mints, then the coin is spent" {
+    const gpa = testing.allocator;
+    const alice = Key.init(1);
+    const bob = Key.init(2);
+
+    // Block A (genesis): coinbase mints 1000 to Alice. No pre-seeding.
+    const h0 = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }; // height 0, LE
+    const cb_a = Transaction{
+        .version = 1,
+        .inputs = &.{},
+        .outputs = &.{.{ .value = 1000, .scheme = .ml_dsa_44, .commitment = alice.commitment() }},
+        .witnesses = &.{},
+        .payload = &h0,
+    };
+    const cb_a_id = try cb_a.txid(gpa);
+
+    // Block B: coinbase (height 1) + Alice spends her minted coin to Bob.
+    const h1 = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 };
+    const cb_b = Transaction{
+        .version = 1,
+        .inputs = &.{},
+        .outputs = &.{.{ .value = 50, .scheme = .ml_dsa_44, .commitment = bob.commitment() }},
+        .witnesses = &.{},
+        .payload = &h1,
+    };
+    var alice_spend = Transaction{
+        .version = 1,
+        .inputs = &.{.{ .outpoint = .{ .txid = cb_a_id, .index = 0 } }},
+        .outputs = &.{.{ .value = 900, .scheme = .ml_dsa_44, .commitment = bob.commitment() }},
+        .witnesses = &.{},
+    };
+    const sh = try alice_spend.sighash(gpa, .ml_dsa_44);
+    const sig = alice.sign(sh);
+    alice_spend.witnesses = &.{.{ .scheme = .ml_dsa_44, .pubkey = &alice.pk, .signature = &sig }};
+
+    var dag = Dag.init(gpa);
+    defer dag.deinit();
+    try dag.addBlock(h(1), &.{});
+    try dag.addBlock(h(2), &.{h(1)});
+
+    var gd = Ghostdag.init(gpa, &dag, 1);
+    defer gd.deinit();
+    try gd.compute();
+
+    var set: UtxoSet = .{};
+    defer set.deinit(gpa);
+    const blocks = [_]BlockTxs{
+        .{ .id = h(1), .txs = &.{cb_a} },
+        .{ .id = h(2), .txs = &.{ cb_b, alice_spend } },
+    };
+    const stats = try applyOrder(gpa, &set, &gd, &blocks);
+
+    try testing.expectEqual(@as(usize, 3), stats.applied); // 2 coinbases + 1 spend
+    try testing.expectEqual(@as(usize, 0), stats.rejected);
+
+    // Alice's minted coin is spent; Bob holds cb_b's 50 and the 900 from Alice.
+    try testing.expect(!set.contains(.{ .txid = cb_a_id, .index = 0 }));
+    const spend_id = try alice_spend.txid(gpa);
+    try testing.expect(set.contains(.{ .txid = spend_id, .index = 0 }));
+    try testing.expectEqual(@as(usize, 2), set.count()); // cb_b output + alice->bob output
 }
