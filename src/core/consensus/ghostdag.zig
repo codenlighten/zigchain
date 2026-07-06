@@ -51,12 +51,14 @@ pub const Ghostdag = struct {
     data: std.AutoHashMapUnmanaged(Hash256, GhostdagData) = .empty,
     /// Position of each block in the DAG's deterministic topological order.
     topo_index: std.AutoHashMapUnmanaged(Hash256, u32) = .empty,
-    /// The topological order itself (index -> block id).
+    /// The topological order itself (index -> block id), used only to order
+    /// mergesets. Recomputed on each `compute`/`addBlock`.
     topo: []Hash256 = &.{},
-    /// Reachability cache: `past_bits[i]` has bit j set iff topo[j] ∈ past(topo[i]).
-    /// Built once in `compute`, this makes ancestor queries O(1) instead of O(n)
-    /// BFS — the difference between O(n⁴) and O(n³) coloring at scale.
-    past_bits: []std.DynamicBitSetUnmanaged = &.{},
+    /// Reachability: each block's set of ancestor ids, maintained INCREMENTALLY.
+    /// Adding a block computes only its own past (union of its parents'), so
+    /// existing blocks' reachability is never recomputed — the key to coloring a
+    /// growing chain in O(n) per block instead of rebuilding everything.
+    past: std.AutoHashMapUnmanaged(Hash256, HashSet) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, dag: *const Dag, k: u32) Ghostdag {
         return .{ .gpa = gpa, .dag = dag, .k = k };
@@ -67,8 +69,9 @@ pub const Ghostdag = struct {
         while (it.next()) |e| e.value_ptr.deinit(self.gpa);
         self.data.deinit(self.gpa);
         self.topo_index.deinit(self.gpa);
-        for (self.past_bits) |*b| b.deinit(self.gpa);
-        if (self.past_bits.len > 0) self.gpa.free(self.past_bits);
+        var pit = self.past.iterator();
+        while (pit.next()) |e| e.value_ptr.deinit(self.gpa);
+        self.past.deinit(self.gpa);
         if (self.topo.len > 0) self.gpa.free(self.topo);
     }
 
@@ -81,33 +84,49 @@ pub const Ghostdag = struct {
     /// after `compute`.
     pub fn isAncestorOrSelf(self: *const Ghostdag, a: Hash256, b: Hash256) bool {
         if (eql(a, b)) return true;
-        _ = self.topo_index.get(a) orelse return false;
-        _ = self.topo_index.get(b) orelse return false;
-        return self.bitAncestor(a, b);
+        return self.isAncestor(a, b);
     }
 
-    /// Color the entire DAG. Processes blocks in topological order so each
-    /// block's selected parent is already computed.
-    pub fn compute(self: *Ghostdag) Error!void {
-        const topo = try self.dag.topoOrder(self.gpa);
-        self.topo = topo; // ownership transferred; freed in deinit
-        for (topo, 0..) |id, i| try self.topo_index.put(self.gpa, id, @intCast(i));
+    /// Refresh the topological order (used only to order mergesets). O(n).
+    fn refreshTopo(self: *Ghostdag) Error!void {
+        if (self.topo.len > 0) self.gpa.free(self.topo);
+        self.topo_index.clearRetainingCapacity();
+        self.topo = try self.dag.topoOrder(self.gpa);
+        for (self.topo, 0..) |id, i| try self.topo_index.put(self.gpa, id, @intCast(i));
+    }
 
-        // Build the reachability cache in topological order: a block's past is
-        // the union of each parent's past plus the parent itself.
-        const n = topo.len;
-        self.past_bits = try self.gpa.alloc(std.DynamicBitSetUnmanaged, n);
-        for (topo, 0..) |id, i| {
-            self.past_bits[i] = try std.DynamicBitSetUnmanaged.initEmpty(self.gpa, n);
-            const parents = self.dag.parentsOf(id) orelse return Error.MissingBlock;
-            for (parents) |p| {
-                const pi = self.topo_index.get(p).?;
-                self.past_bits[i].set(pi);
-                self.past_bits[i].setUnion(self.past_bits[pi]);
+    /// Build a block's ancestor set from its (already-processed) parents.
+    fn buildPast(self: *Ghostdag, id: Hash256) Error!void {
+        if (self.past.contains(id)) return;
+        var set: HashSet = .empty;
+        errdefer set.deinit(self.gpa);
+        const parents = self.dag.parentsOf(id) orelse return Error.MissingBlock;
+        for (parents) |p| {
+            try set.put(self.gpa, p, {});
+            if (self.past.getPtr(p)) |pp| {
+                var it = pp.iterator();
+                while (it.next()) |e| try set.put(self.gpa, e.key_ptr.*, {});
             }
         }
+        try self.past.put(self.gpa, id, set);
+    }
 
-        for (topo) |id| try self.computeBlock(id);
+    /// Color the entire DAG in one shot (batch). Equivalent to calling
+    /// `addBlock` for every block in topological order.
+    pub fn compute(self: *Ghostdag) Error!void {
+        try self.refreshTopo();
+        for (self.topo) |id| {
+            try self.buildPast(id);
+            try self.computeBlock(id);
+        }
+    }
+
+    /// Incrementally color a newly-added block, reusing all existing data.
+    /// Its parents must already be colored. This is what a growing chain calls.
+    pub fn addBlock(self: *Ghostdag, id: Hash256) Error!void {
+        try self.buildPast(id);
+        try self.refreshTopo(); // needed to order this block's mergeset
+        try self.computeBlock(id);
     }
 
     fn computeBlock(self: *Ghostdag, id: Hash256) Error!void {
@@ -201,39 +220,43 @@ pub const Ghostdag = struct {
         return true;
     }
 
-    /// Mergeset = past(id) \ past(sp) \ {sp}, already in topological order
-    /// (iterating ancestor indices ascending == a topological order).
+    /// Mergeset = past(id) \ past(sp) \ {sp}, ordered by the DAG's topological
+    /// order (so candidates are colored after their ancestors).
     fn orderedMergeset(self: *Ghostdag, id: Hash256, sp: Hash256) Error![]Hash256 {
-        const n = self.topo.len;
-        const past_id = &self.past_bits[self.topo_index.get(id).?];
-        const isp = self.topo_index.get(sp).?;
-        const past_sp = &self.past_bits[isp];
+        const past_id = self.past.getPtr(id).?;
+        const past_sp = self.past.getPtr(sp).?;
 
         var out: std.ArrayList(Hash256) = .empty;
         errdefer out.deinit(self.gpa);
-        var ai: usize = 0;
-        while (ai < n) : (ai += 1) {
-            if (!past_id.isSet(ai)) continue; // not in past(id)
-            if (ai == isp) continue; // that's sp
-            if (past_sp.isSet(ai)) continue; // in past(sp)
-            try out.append(self.gpa, self.topo[ai]);
+        var it = past_id.iterator();
+        while (it.next()) |e| {
+            const x = e.key_ptr.*;
+            if (eql(x, sp)) continue; // that's sp
+            if (past_sp.contains(x)) continue; // in past(sp)
+            try out.append(self.gpa, x);
         }
+
+        const idx = &self.topo_index;
+        std.mem.sort(Hash256, out.items, idx, struct {
+            fn lt(index: *const std.AutoHashMapUnmanaged(Hash256, u32), a: Hash256, b: Hash256) bool {
+                return index.get(a).? < index.get(b).?;
+            }
+        }.lt);
         return out.toOwnedSlice(self.gpa);
     }
 
-    // --- reachability (O(1) via the precomputed cache) ---
+    // --- reachability (O(1) query via the persistent per-block ancestor sets) ---
 
     /// Is `a` an ancestor of `b` (a ∈ past(b))?
-    fn bitAncestor(self: *const Ghostdag, a: Hash256, b: Hash256) bool {
-        const ia = self.topo_index.get(a).?;
-        const ib = self.topo_index.get(b).?;
-        return self.past_bits[ib].isSet(ia);
+    fn isAncestor(self: *const Ghostdag, a: Hash256, b: Hash256) bool {
+        const pb = self.past.getPtr(b) orelse return false;
+        return pb.contains(a);
     }
 
     fn inAnticone(self: *const Ghostdag, x: Hash256, y: Hash256) bool {
         if (eql(x, y)) return false;
-        if (self.bitAncestor(x, y)) return false;
-        if (self.bitAncestor(y, x)) return false;
+        if (self.isAncestor(x, y)) return false;
+        if (self.isAncestor(y, x)) return false;
         return true;
     }
 

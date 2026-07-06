@@ -154,18 +154,21 @@ pub const Chain = struct {
             .height = block_height,
         });
 
-        // Commit: DAG + metadata, then recolor.
+        // Commit: DAG + metadata, then color just this block.
         try self.dag.addBlock(id, block.header.parents);
         try self.blocks.put(self.gpa, id, block);
         try self.heights.put(self.gpa, id, block_height);
-        try self.recolor();
+        try self.colorNewBlock(id);
         return id;
     }
 
-    fn recolor(self: *Chain) Error!void {
-        if (self.gd) |*g| g.deinit();
-        self.gd = Ghostdag.init(self.gpa, &self.dag, self.cfg.ghostdag_k);
-        try self.gd.?.compute();
+    /// Incrementally color the newly-accepted block, reusing all prior coloring
+    /// — the GHOSTDAG data of existing blocks is immutable, so nothing is
+    /// recomputed. (The engine previously rebuilt the entire coloring on every
+    /// accept, which was O(n) reachability + recolor-all per block.)
+    fn colorNewBlock(self: *Chain, id: Hash256) Error!void {
+        if (self.gd == null) self.gd = Ghostdag.init(self.gpa, &self.dag, self.cfg.ghostdag_k);
+        try self.gd.?.addBlock(id);
     }
 
     pub fn tip(self: *const Chain) ?Hash256 {

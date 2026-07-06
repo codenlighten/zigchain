@@ -204,3 +204,64 @@ test "property: GHOSTDAG invariants hold on random DAGs" {
         }
     }
 }
+
+test "property: incremental GHOSTDAG (addBlock) equals batch GHOSTDAG (compute)" {
+    const gpa = testing.allocator;
+    var seed: u64 = 2000;
+    while (seed < 2060) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const n = rng.intRangeAtMost(u32, 1, 14);
+        const k = rng.intRangeAtMost(u32, 0, 3);
+
+        var s = try randomStructure(gpa, rng, n);
+        defer s.deinit(gpa);
+        const index_order = try gpa.alloc(u32, n);
+        defer gpa.free(index_order);
+        for (0..n) |i| index_order[i] = @intCast(i);
+
+        // Batch: full DAG, color in one shot.
+        var dag_b = try buildDag(gpa, s, index_order);
+        defer dag_b.deinit();
+        var gd_batch = Ghostdag.init(gpa, &dag_b, k);
+        defer gd_batch.deinit();
+        try gd_batch.compute();
+
+        // Incremental: grow the DAG and color each block as it arrives (the
+        // chain engine's exact usage pattern).
+        var dag_i = Dag.init(gpa);
+        defer dag_i.deinit();
+        var gd_inc = Ghostdag.init(gpa, &dag_i, k);
+        defer gd_inc.deinit();
+        for (0..n) |i| {
+            const ps = try gpa.alloc(Hash256, s.parents[i].len);
+            defer gpa.free(ps);
+            for (s.parents[i], 0..) |pi, j| ps[j] = idOf(pi);
+            try dag_i.addBlock(idOf(@intCast(i)), ps);
+            try gd_inc.addBlock(idOf(@intCast(i)));
+        }
+
+        // Every block must have identical coloring.
+        for (0..n) |i| {
+            const id = idOf(@intCast(i));
+            const d1 = gd_batch.get(id).?;
+            const d2 = gd_inc.get(id).?;
+            try testing.expectEqual(d1.blue_score, d2.blue_score);
+            if (d1.selected_parent) |sp1| {
+                try testing.expect(d2.selected_parent != null);
+                try testing.expectEqualSlices(u8, &sp1, &d2.selected_parent.?);
+            } else {
+                try testing.expect(d2.selected_parent == null);
+            }
+            try testing.expectEqualSlices(Hash256, d1.mergeset_blues, d2.mergeset_blues);
+            try testing.expectEqualSlices(Hash256, d1.mergeset_reds, d2.mergeset_reds);
+        }
+
+        // ...and the same virtual-chain order.
+        const o1 = try gd_batch.order(gpa);
+        defer gpa.free(o1);
+        const o2 = try gd_inc.order(gpa);
+        defer gpa.free(o2);
+        try testing.expectEqualSlices(Hash256, o1, o2);
+    }
+}
