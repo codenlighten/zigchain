@@ -23,7 +23,7 @@ const ghostdag = @import("ghostdag.zig");
 const block_validation = @import("../ledger/block_validation.zig");
 const utxo = @import("../ledger/utxo.zig");
 const acc = @import("../ledger/accumulator.zig");
-const processor = @import("processor.zig");
+const ledger_state = @import("ledger_state.zig");
 const hashmod = @import("../crypto/hash.zig");
 
 const Hash256 = hashmod.Hash256;
@@ -80,15 +80,20 @@ pub const Chain = struct {
     blocks: std.AutoHashMapUnmanaged(Hash256, Block) = .empty,
     heights: std.AutoHashMapUnmanaged(Hash256, u64) = .empty,
     gd: ?Ghostdag = null,
+    /// Incrementally-maintained, reorg-aware UTXO state.
+    led: ledger_state.IncrementalUtxo,
+    txmap: ledger_state.BlockTxMap = .empty,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) Chain {
-        return .{ .gpa = gpa, .cfg = cfg, .dag = Dag.init(gpa) };
+        return .{ .gpa = gpa, .cfg = cfg, .dag = Dag.init(gpa), .led = ledger_state.IncrementalUtxo.init(gpa) };
     }
 
     pub fn deinit(self: *Chain) void {
         if (self.gd) |*g| g.deinit();
         self.blocks.deinit(self.gpa);
         self.heights.deinit(self.gpa);
+        self.led.deinit();
+        self.txmap.deinit(self.gpa);
         self.dag.deinit();
     }
 
@@ -159,6 +164,13 @@ pub const Chain = struct {
         try self.blocks.put(self.gpa, id, block);
         try self.heights.put(self.gpa, id, block_height);
         try self.colorNewBlock(id);
+
+        // Incrementally bring the UTXO state in line with the new consensus
+        // order (handles reorgs via undo data — see ledger_state.zig).
+        try self.txmap.put(self.gpa, id, block.txs);
+        const order = try self.gd.?.order(self.gpa);
+        defer self.gpa.free(order);
+        try self.led.update(order, &self.txmap);
         return id;
     }
 
@@ -179,18 +191,13 @@ pub const Chain = struct {
         return self.heights.get(id);
     }
 
-    /// Re-derive the UTXO state from the current consensus order. Caller owns
-    /// the returned set.
+    /// A copy of the current UTXO state. Caller owns the returned set. (The
+    /// authoritative state is maintained incrementally in `self.led`.)
     pub fn utxoSet(self: *Chain) Error!utxo.UtxoSet {
-        var items: std.ArrayList(processor.BlockTxs) = .empty;
-        defer items.deinit(self.gpa);
-        var it = self.blocks.iterator();
-        while (it.next()) |e| {
-            try items.append(self.gpa, .{ .id = e.key_ptr.*, .txs = e.value_ptr.txs });
-        }
         var set: utxo.UtxoSet = .{};
         errdefer set.deinit(self.gpa);
-        _ = try processor.applyOrder(self.gpa, &set, &self.gd.?, items.items);
+        var it = self.led.set.map.iterator();
+        while (it.next()) |e| try set.add(self.gpa, e.key_ptr.*, e.value_ptr.*);
         return set;
     }
 
@@ -198,12 +205,9 @@ pub const Chain = struct {
     /// state. Coins are inserted in canonical outpoint order so the resulting
     /// roots — and hence the commitment — are deterministic. Caller deinits.
     pub fn buildAccumulator(self: *Chain) Error!acc.Forest {
-        var set = try self.utxoSet();
-        defer set.deinit(self.gpa);
-
         var coins: std.ArrayList(Coin) = .empty;
         defer coins.deinit(self.gpa);
-        var it = set.map.iterator();
+        var it = self.led.set.map.iterator();
         while (it.next()) |e| try coins.append(self.gpa, .{ .op = e.key_ptr.*, .out = e.value_ptr.* });
         std.mem.sort(Coin, coins.items, {}, lessCoin);
 

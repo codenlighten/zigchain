@@ -22,6 +22,7 @@ pub const mass = @import("core/consensus/mass.zig");
 pub const finality = @import("core/consensus/finality.zig");
 pub const pow = @import("core/consensus/pow.zig");
 pub const chain = @import("core/consensus/chain.zig");
+pub const ledger_state = @import("core/consensus/ledger_state.zig");
 pub const parallel = @import("core/consensus/parallel.zig");
 pub const fees = @import("core/consensus/fees.zig");
 pub const mempool = @import("node/mempool.zig");
@@ -47,6 +48,7 @@ test {
     _ = finality;
     _ = pow;
     _ = chain;
+    _ = ledger_state;
     _ = parallel;
     _ = fees;
     _ = mempool;
