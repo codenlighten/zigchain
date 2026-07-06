@@ -25,6 +25,7 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 | **Chain engine** | `src/core/consensus/chain.zig` | Block acceptance: verify PoW, enforce DAA difficulty, height, validate, recolor, derive UTXO |
 | Finality | `src/core/consensus/finality.zig` | PQ-BFT finality over a DAG cut (spec: `spec/finality.md`) |
 | Processor | `src/core/consensus/processor.zig` | Applies txs in GHOSTDAG order; deterministic cross-anticone double-spend resolution |
+| Mempool | `src/node/mempool.zig` | Pending txs; fee-rate block selection under a mass cap; edge **policy hook** (compliance without touching consensus) |
 
 ```
 zig build test --summary all      # 45/45 passing

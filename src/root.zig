@@ -20,6 +20,7 @@ pub const mass = @import("core/consensus/mass.zig");
 pub const finality = @import("core/consensus/finality.zig");
 pub const pow = @import("core/consensus/pow.zig");
 pub const chain = @import("core/consensus/chain.zig");
+pub const mempool = @import("node/mempool.zig");
 
 test {
     // Pull every module's tests into the root test binary.
@@ -38,6 +39,7 @@ test {
     _ = finality;
     _ = pow;
     _ = chain;
+    _ = mempool;
     _ = @import("tests/properties.zig");
     _ = @import("sim/simnet.zig");
 }
