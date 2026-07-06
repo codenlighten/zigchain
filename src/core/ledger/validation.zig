@@ -216,3 +216,41 @@ test "forged witness (wrong key) is rejected as commitment mismatch" {
     // Mallory's pubkey does not hash to Alice's committed output.
     try testing.expectError(prim.SpendError.CommitmentMismatch, validateTx(&set, tx, gpa));
 }
+
+test "batched settlement: one signed input pays hundreds of recipients" {
+    const gpa = testing.allocator;
+    var set: UtxoSet = .{};
+    defer set.deinit(gpa);
+    const settler = TestKey.init(7);
+
+    // A netted position worth 1,000,000 held by the settlement agent.
+    const funding = OutPoint{ .txid = [_]u8{0x5E} ** 32, .index = 0 };
+    try set.add(gpa, funding, .{ .value = 1_000_000, .scheme = .ml_dsa_44, .commitment = settler.commitment() });
+
+    // One transaction settles 500 net transfers of 1000 each (fee = the remainder).
+    const n = 500;
+    const outs = try gpa.alloc(prim.Output, n);
+    defer gpa.free(outs);
+    for (outs, 0..) |*o, i| o.* = .{ .value = 1000, .scheme = .ml_dsa_44, .commitment = prim.addressCommitment(.ml_dsa_44, &TestKey.init(@intCast(100 + (i % 50))).pk) };
+
+    var tx = Transaction{
+        .version = 1,
+        .inputs = &.{.{ .outpoint = funding }},
+        .outputs = outs,
+        .witnesses = &.{},
+    };
+    const sh = try tx.sighash(gpa, .ml_dsa_44);
+    const sig = settler.sign(sh);
+    tx.witnesses = &.{.{ .scheme = .ml_dsa_44, .pubkey = &settler.pk, .signature = &sig }};
+
+    // One signature authorises all 500 transfers; fee = 1,000,000 - 500*1000.
+    const fee = try validateTx(&set, tx, gpa);
+    try testing.expectEqual(@as(u64, 500_000), fee);
+
+    try connectTx(&set, tx, gpa);
+    try testing.expect(!set.contains(funding)); // netted input consumed
+    const id = try tx.txid(gpa);
+    try testing.expect(set.contains(.{ .txid = id, .index = 0 }));
+    try testing.expect(set.contains(.{ .txid = id, .index = n - 1 }));
+    try testing.expectEqual(@as(usize, n), set.count()); // 500 settled outputs created
+}
