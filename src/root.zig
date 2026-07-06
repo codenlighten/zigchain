@@ -19,6 +19,7 @@ pub const processor = @import("core/consensus/processor.zig");
 pub const mass = @import("core/consensus/mass.zig");
 pub const finality = @import("core/consensus/finality.zig");
 pub const pow = @import("core/consensus/pow.zig");
+pub const chain = @import("core/consensus/chain.zig");
 
 test {
     // Pull every module's tests into the root test binary.
@@ -36,6 +37,7 @@ test {
     _ = mass;
     _ = finality;
     _ = pow;
+    _ = chain;
     _ = @import("tests/properties.zig");
     _ = @import("sim/simnet.zig");
 }
