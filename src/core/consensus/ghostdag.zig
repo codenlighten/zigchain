@@ -76,6 +76,16 @@ pub const Ghostdag = struct {
         return self.data.getPtr(id);
     }
 
+    /// Is `a` an ancestor of `b`, or `a == b`? Used by the finality gadget to
+    /// decide whether a block lies within a finalized cut's past. Valid only
+    /// after `compute`.
+    pub fn isAncestorOrSelf(self: *const Ghostdag, a: Hash256, b: Hash256) bool {
+        if (eql(a, b)) return true;
+        _ = self.topo_index.get(a) orelse return false;
+        _ = self.topo_index.get(b) orelse return false;
+        return self.bitAncestor(a, b);
+    }
+
     /// Color the entire DAG. Processes blocks in topological order so each
     /// block's selected parent is already computed.
     pub fn compute(self: *Ghostdag) Error!void {

@@ -28,6 +28,7 @@ pub const Domain = enum {
     merkle_node,
     block_header,
     witness,
+    finality_vote,
 
     pub fn context(self: Domain) []const u8 {
         return switch (self) {
@@ -39,6 +40,7 @@ pub const Domain = enum {
             .merkle_node => "zigchain.v1.merkle.node",
             .block_header => "zigchain.v1.block.header",
             .witness => "zigchain.v1.witness",
+            .finality_vote => "zigchain.v1.finality.vote",
         };
     }
 };
