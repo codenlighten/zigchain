@@ -77,7 +77,7 @@ pub const Mempool = struct {
         // Consensus validity against confirmed state (also proves no confirmed
         // double-spend). Returns the fee.
         const fee = validation.validateTx(set, tx, self.gpa) catch return .invalid;
-        const m = massmod.txMass(tx) catch return .invalid;
+        const m = massmod.txMass(self.gpa, tx) catch return .invalid;
 
         for (tx.inputs) |in| try self.spent.put(self.gpa, in.outpoint, {});
         try self.ids.put(self.gpa, id, {});
@@ -289,7 +289,7 @@ test "block selection is fee-rate ordered and mass-capped" {
     try testing.expectEqual(@as(u64, 900), all[2].outputs[0].value);
 
     // With a mass cap that fits only one, we get just the best-fee tx.
-    const one_mass = massmod.txMass(all[0]) catch unreachable;
+    const one_mass = massmod.txMass(arena, all[0]) catch unreachable;
     const top = try mp.selectForBlock(arena, one_mass);
     try testing.expectEqual(@as(usize, 1), top.len);
     try testing.expectEqual(@as(u64, 500), top[0].outputs[0].value);

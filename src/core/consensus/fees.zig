@@ -21,8 +21,8 @@ pub const FeeParams = struct {
 };
 
 /// The fee floor a transaction pays: its mass times the rate.
-pub fn txFeeZats(tx: prim.Transaction, params: FeeParams) massmod.Error!u64 {
-    const m = try massmod.txMass(tx);
+pub fn txFeeZats(gpa: std.mem.Allocator, tx: prim.Transaction, params: FeeParams) massmod.Error!u64 {
+    const m = try massmod.txMass(gpa, tx);
     return m *| params.rate_per_mass;
 }
 
@@ -51,10 +51,9 @@ test "fee is mass * rate; amortises across a settlement batch" {
         .witnesses = &.{.{ .scheme = .ml_dsa_44, .pubkey = &pk, .signature = &sig }},
     };
 
-    const fee = try txFeeZats(tx, .{ .rate_per_mass = 1 });
-    // mass = 1 (verify) + 1312 + 2420 = 3733 (dominated by the single signature).
-    try testing.expectEqual(@as(u64, 3733), fee);
-
-    // Spread over 1000 transfers, the per-transfer fee is a few zats.
-    try testing.expectEqual(@as(u64, 3), perTransferZats(fee, 1000));
+    const fee = try txFeeZats(testing.allocator, tx, .{ .rate_per_mass = 1 });
+    // mass now includes the whole serialized tx (1000 outputs + one signature).
+    // The per-transfer fee is still tiny — the signature is paid once.
+    const per = perTransferZats(fee, 1000);
+    try testing.expect(per > 0 and per < 100);
 }

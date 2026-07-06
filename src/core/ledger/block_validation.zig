@@ -63,7 +63,7 @@ pub fn validateStateless(gpa: std.mem.Allocator, block: Block, cfg: Config) Erro
     if (!std.mem.eql(u8, &wr, &block.header.witness_root)) return Error.BadWitnessRoot;
 
     // Signature-verification cost / size is bounded.
-    _ = try mass.checkBlockMass(block.txs, cfg.max_block_mass);
+    _ = try mass.checkBlockMass(gpa, block.txs, cfg.max_block_mass);
 
     // Coinbase mints at most the subsidy.
     var cb_sum: u64 = 0;

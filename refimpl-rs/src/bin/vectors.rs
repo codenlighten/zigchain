@@ -140,11 +140,14 @@ fn main() {
         println!("tx {i} txid {}", to_hex(&tx.txid()));
         println!("tx {i} wtxid {}", to_hex(&tx.wtxid()));
         println!("tx {i} sighash {}", to_hex(&tx.sighash(tv.sighash_scheme)));
-        let mass: u64 = tx
-            .witnesses
-            .iter()
-            .map(|w| verify_mass(w.scheme) + w.pubkey.len() as u64 + w.signature.len() as u64)
-            .sum();
+        // mass = full serialized bytes (body + witnesses) + per-scheme verify cost.
+        let mut w = Writer::default();
+        tx.encode_body(&mut w);
+        tx.encode_witnesses(&mut w);
+        let mut mass = w.0.len() as u64;
+        for wit in &tx.witnesses {
+            mass += verify_mass(wit.scheme);
+        }
         println!("tx {i} mass {mass}");
     }
 

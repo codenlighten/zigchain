@@ -117,7 +117,7 @@ pub fn main() !void {
             out.line("tx {d} txid {s}\n", .{ i, std.fmt.bytesToHex(try tx.txid(gpa), .lower) });
             out.line("tx {d} wtxid {s}\n", .{ i, std.fmt.bytesToHex(try tx.wtxid(gpa), .lower) });
             out.line("tx {d} sighash {s}\n", .{ i, std.fmt.bytesToHex(try tx.sighash(gpa, scheme), .lower) });
-            out.line("tx {d} mass {d}\n", .{ i, try massmod.txMass(tx) });
+            out.line("tx {d} mass {d}\n", .{ i, try massmod.txMass(gpa, tx) });
         }
     }
 
