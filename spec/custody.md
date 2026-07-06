@@ -59,8 +59,28 @@ production signer should additionally receive the full transaction and recompute
 the sighash itself, rather than blind-signing a hash — a straightforward
 extension of this interface.
 
-## Not yet built
+## Threshold k-of-n multisig
 
-Script-level **k-of-n multi-signature** (threshold custody) is a future addition;
-it is deliberately script-level (no BLS threshold, which has no post-quantum
-analogue) and its on-chain size must be budgeted against the large PQ signatures.
+There is no post-quantum threshold *signature* primitive (no BLS analogue), so
+k-of-n is **script-level** (`core/primitives/multisig.zig`): an output commits to
+a policy `H(multisig, threshold ‖ participants)`, and a spend reveals the policy
+and supplies `k` full signatures from distinct participants — the P2SH pattern.
+The trade-off is on-chain size (k full PQ signatures), budgeted via block mass
+(a multisig witness costs the sum of its participants' verify costs).
+
+It rides the existing witness triple with no wire-format change: the `multisig`
+marker scheme (`0x10`), the policy in the witness `pubkey` field, the signer set
+in the `signature` field. Verification is a single allocation-free streaming pass
+(participants ordered; signer indices strictly ascending → distinct, canonical,
+malleability-free). `verifySpend` dispatches to it, so a k-of-n spend is
+consensus-native and validated exactly like a single-key spend. Participants may
+mix schemes (e.g. two ML-DSA hot keys + one SPHINCS+ vault key).
+
+```sh
+# Build a 2-of-3 address from participant pubkeys (from `vault address`):
+vault multisig-address --threshold 2 \
+  --participant ml_dsa_44:<pk0> --participant ml_dsa_65:<pk1> --participant sphincs_128f:<pk2>
+
+# Each signer runs `vault sign` on the spend sighash; combine k of them:
+vault multisig-combine --policy <hex> --sighash <hex32> --sig 0:<sig0> --sig 2:<sig2>
+```

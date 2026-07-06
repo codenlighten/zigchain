@@ -15,8 +15,10 @@ const std = @import("std");
 const linux = std.os.linux;
 const registry = @import("core/crypto/pq/registry.zig");
 const signer = @import("custody/signer.zig");
+const multisig = @import("core/primitives/multisig.zig");
 
 const SchemeTag = registry.SchemeTag;
+const Pair = struct { key: []const u8, val: []const u8 };
 
 fn write(bytes: []const u8) void {
     _ = linux.write(1, bytes.ptr, bytes.len);
@@ -74,6 +76,7 @@ fn parsePath(gpa: std.mem.Allocator, s: []const u8) []u32 {
 
 const Args = struct {
     map: std.StringHashMapUnmanaged([]const u8) = .empty,
+    pairs: std.ArrayList(Pair) = .empty, // preserves repeated flags (--participant, --sig)
     fn get(self: Args, k: []const u8) ?[]const u8 {
         return self.map.get(k);
     }
@@ -81,6 +84,14 @@ const Args = struct {
         return self.map.get(k) orelse fail("--{s} required", .{k});
     }
 };
+
+fn parseU32(s: []const u8) u32 {
+    return std.fmt.parseInt(u32, s, 10) catch fail("bad number '{s}'", .{s});
+}
+
+fn cmpShare(_: void, a: multisig.SignerShare, b: multisig.SignerShare) bool {
+    return a.index < b.index;
+}
 
 pub fn main(init: std.process.Init) void {
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
@@ -95,7 +106,9 @@ pub fn main(init: std.process.Init) void {
     while (it.next()) |a| {
         if (std.mem.startsWith(u8, a, "--")) {
             const key = a[2..];
-            args.map.put(gpa, key, it.next() orelse "") catch fail("oom", .{});
+            const val = it.next() orelse "";
+            args.map.put(gpa, key, val) catch fail("oom", .{});
+            args.pairs.append(gpa, .{ .key = key, .val = val }) catch fail("oom", .{});
         }
     }
 
@@ -137,7 +150,50 @@ pub fn main(init: std.process.Init) void {
         return;
     }
 
-    fail("unknown command '{s}' (address|sign|verify)", .{cmd});
+    // --- k-of-n multisig ---
+
+    if (std.mem.eql(u8, cmd, "multisig-address")) {
+        const threshold = parseU32(args.req("threshold"));
+        var participants: std.ArrayList(multisig.Participant) = .empty;
+        for (args.pairs.items) |p| {
+            if (!std.mem.eql(u8, p.key, "participant")) continue;
+            const ci = std.mem.indexOfScalar(u8, p.val, ':') orelse fail("--participant must be scheme:pubkeyhex", .{});
+            participants.append(gpa, .{ .scheme = parseScheme(p.val[0..ci]), .pubkey = hexAlloc(gpa, p.val[ci + 1 ..]) }) catch fail("oom", .{});
+        }
+        if (participants.items.len == 0) fail("need at least one --participant scheme:pubkeyhex", .{});
+        if (threshold < 1 or threshold > participants.items.len) fail("threshold must be 1..{d}", .{participants.items.len});
+        const policy = multisig.encodePolicy(gpa, threshold, participants.items) catch fail("policy encoding failed", .{});
+        out("threshold: {d}-of-{d}", .{ threshold, participants.items.len });
+        outHex(gpa, "address", &multisig.commitment(policy));
+        outHex(gpa, "policy", policy); // needed at spend time (goes in witness.pubkey)
+        return;
+    }
+
+    if (std.mem.eql(u8, cmd, "multisig-combine")) {
+        const policy = hexAlloc(gpa, args.req("policy"));
+        const sighash = hex32(args.req("sighash"));
+        var shares: std.ArrayList(multisig.SignerShare) = .empty;
+        for (args.pairs.items) |p| {
+            if (!std.mem.eql(u8, p.key, "sig")) continue;
+            const ci = std.mem.indexOfScalar(u8, p.val, ':') orelse fail("--sig must be index:sighex", .{});
+            shares.append(gpa, .{ .index = parseU32(p.val[0..ci]), .signature = hexAlloc(gpa, p.val[ci + 1 ..]) }) catch fail("oom", .{});
+        }
+        std.mem.sort(multisig.SignerShare, shares.items, {}, cmpShare);
+        const signers = multisig.encodeSigners(gpa, shares.items) catch fail("signer encoding failed", .{});
+        const commit = multisig.commitment(policy);
+        multisig.verify(commit, policy, signers, sighash) catch |e| {
+            out("INVALID: {s}", .{@errorName(e)});
+            linux.exit(2);
+        };
+        out("VALID ({d} signatures)", .{shares.items.len});
+        outHex(gpa, "address", &commit);
+        // The spend witness: scheme = multisig (0x10), pubkey = policy, signature = signers.
+        outHex(gpa, "witness_pubkey", policy);
+        outHex(gpa, "witness_signature", signers);
+        return;
+    }
+
+    fail("unknown command '{s}' (address|sign|verify|multisig-address|multisig-combine)", .{cmd});
 }
 
 fn hexAlloc(gpa: std.mem.Allocator, s: []const u8) []u8 {

@@ -12,6 +12,7 @@ pub const kdf = @import("core/crypto/kdf.zig");
 pub const signer = @import("custody/signer.zig");
 pub const codec = @import("core/serialization/codec.zig");
 pub const primitives = @import("core/primitives/types.zig");
+pub const multisig = @import("core/primitives/multisig.zig");
 pub const utxo = @import("core/ledger/utxo.zig");
 pub const sharded_utxo = @import("core/ledger/sharded_utxo.zig");
 pub const accumulator = @import("core/ledger/accumulator.zig");
@@ -43,6 +44,7 @@ test {
     _ = signer;
     _ = codec;
     _ = primitives;
+    _ = multisig;
     _ = utxo;
     _ = sharded_utxo;
     _ = accumulator;

@@ -14,10 +14,11 @@ const std = @import("std");
 const prim = @import("../primitives/types.zig");
 const pq = @import("../crypto/pq/registry.zig");
 const codec = @import("../serialization/codec.zig");
+const multisig = @import("../primitives/multisig.zig");
 
 pub const default_max_block_mass: u64 = 1_000_000;
 
-pub const Error = error{BlockTooHeavy} || pq.Error || std.mem.Allocator.Error;
+pub const Error = error{BlockTooHeavy} || multisig.Error || std.mem.Allocator.Error;
 
 fn addOrHeavy(a: u64, b: u64) Error!u64 {
     return std.math.add(u64, a, b) catch Error.BlockTooHeavy;
@@ -33,8 +34,13 @@ pub fn txMass(gpa: std.mem.Allocator, tx: prim.Transaction) Error!u64 {
 
     var m: u64 = @intCast(list.items.len);
     for (tx.witnesses) |wit| {
-        const meta = try pq.info(wit.scheme);
-        m = try addOrHeavy(m, meta.verify_mass);
+        // A multisig witness costs the sum of its k participating verifies;
+        // a single-key witness costs its one scheme's verify.
+        const cost = if (wit.scheme == .multisig)
+            try multisig.witnessMass(wit.pubkey, wit.signature)
+        else
+            (try pq.info(wit.scheme)).verify_mass;
+        m = try addOrHeavy(m, cost);
     }
     return m;
 }

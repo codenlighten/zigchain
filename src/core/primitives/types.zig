@@ -15,6 +15,7 @@ const std = @import("std");
 const hashmod = @import("../crypto/hash.zig");
 const pq = @import("../crypto/pq/registry.zig");
 const codec = @import("../serialization/codec.zig");
+const multisig = @import("multisig.zig");
 
 const Hash256 = hashmod.Hash256;
 const SchemeTag = pq.SchemeTag;
@@ -189,7 +190,7 @@ pub fn addressCommitment(scheme: SchemeTag, pubkey: []const u8) Hash256 {
     return h.final();
 }
 
-pub const SpendError = error{CommitmentMismatch} || pq.Error;
+pub const SpendError = multisig.Error; // includes CommitmentMismatch, pq.Error, codec errors
 
 /// Verify that `witness` authorises spending an output with `expected_commitment`,
 /// given the transaction's `sighash_msg`. Checks the (scheme, pubkey) commitment
@@ -199,6 +200,12 @@ pub fn verifySpend(
     expected_commitment: Hash256,
     sighash_msg: Hash256,
 ) SpendError!void {
+    // k-of-n multisig: the witness reveals the policy (in `pubkey`) and supplies
+    // the signer set (in `signature`); the output commits to H(multisig, policy).
+    if (witness.scheme == .multisig) {
+        return multisig.verify(expected_commitment, witness.pubkey, witness.signature, sighash_msg);
+    }
+    // Single-key spend: the commitment binds (scheme, pubkey), then the signature.
     const derived = addressCommitment(witness.scheme, witness.pubkey);
     if (!std.mem.eql(u8, &derived, &expected_commitment)) return error.CommitmentMismatch;
     try pq.verify(witness.scheme, witness.pubkey, &sighash_msg, witness.signature);
@@ -269,4 +276,53 @@ test "end-to-end: create output, spend it with a real ML-DSA-44 signature" {
     // Right key, wrong sighash (e.g. attacker altered outputs) → rejected.
     const other_sh = try tx.sighash(gpa, .ml_dsa_65);
     try testing.expectError(pq.Error.InvalidSignature, verifySpend(witness, commitment, other_sh));
+}
+
+test "verifySpend authorises a k-of-n multisig spend end-to-end" {
+    const gpa = testing.allocator;
+    const MlDsa65 = std.crypto.sign.mldsa.MLDSA65;
+
+    // 2-of-3: two ML-DSA-44 keys and one ML-DSA-65 key.
+    const kp0 = try MlDsa44.KeyPair.generateDeterministic([_]u8{10} ** 32);
+    const kp1 = try MlDsa65.KeyPair.generateDeterministic([_]u8{11} ** 32);
+    const kp2 = try MlDsa44.KeyPair.generateDeterministic([_]u8{12} ** 32);
+    const pk0 = kp0.public_key.toBytes();
+    const pk1 = kp1.public_key.toBytes();
+    const pk2 = kp2.public_key.toBytes();
+
+    const parts = [_]multisig.Participant{
+        .{ .scheme = .ml_dsa_44, .pubkey = &pk0 },
+        .{ .scheme = .ml_dsa_65, .pubkey = &pk1 },
+        .{ .scheme = .ml_dsa_44, .pubkey = &pk2 },
+    };
+    const policy = try multisig.encodePolicy(gpa, 2, &parts);
+    defer gpa.free(policy);
+    const commitment = multisig.commitment(policy); // == the output's commitment
+
+    // The spend's sighash is bound to the multisig marker scheme.
+    const tx = Transaction{
+        .version = 1,
+        .inputs = &.{.{ .outpoint = .{ .txid = hashmod.zero, .index = 0 } }},
+        .outputs = &.{.{ .value = 5, .scheme = .multisig, .commitment = hashmod.zero }},
+        .witnesses = &.{},
+    };
+    const sh = try tx.sighash(gpa, .multisig);
+
+    // Participants 1 and 2 sign (each under their own scheme's context).
+    const ctx65 = [_]u8{@intFromEnum(SchemeTag.ml_dsa_65)};
+    const ctx44 = [_]u8{@intFromEnum(SchemeTag.ml_dsa_44)};
+    const s1 = (try kp1.signWithContext(&sh, null, &ctx65)).toBytes();
+    const s2 = (try kp2.signWithContext(&sh, null, &ctx44)).toBytes();
+    const signers = try multisig.encodeSigners(gpa, &.{
+        .{ .index = 1, .signature = &s1 },
+        .{ .index = 2, .signature = &s2 },
+    });
+    defer gpa.free(signers);
+
+    // The multisig witness rides the normal witness triple.
+    const witness = Witness{ .scheme = .multisig, .pubkey = policy, .signature = signers };
+    try verifySpend(witness, commitment, sh);
+
+    // Spending a different policy's output → rejected.
+    try testing.expectError(error.CommitmentMismatch, verifySpend(witness, hashmod.zero, sh));
 }

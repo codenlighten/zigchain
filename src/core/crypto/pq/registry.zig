@@ -25,6 +25,9 @@ pub const SchemeTag = enum(u8) {
     ml_dsa_65 = 0x02,
     sphincs_shake_128s = 0x03, // vault / cold — small signature (7856 B)
     sphincs_shake_128f = 0x04, // vault / cold — fast signing (17088 B)
+    multisig = 0x10, // marker: script-level k-of-n (see primitives/multisig.zig).
+    // Not a base signature scheme — verified via multisig.verify, never the
+    // generic path, so info()/verify() below reject it as a directly-usable scheme.
     _, // any other value is consensus-invalid (UnknownScheme)
 };
 
@@ -61,6 +64,7 @@ pub fn info(tag: SchemeTag) Error!SchemeInfo {
         },
         .sphincs_shake_128s => .{ .pubkey_len = 32, .sig_len = 7856, .verify_mass = 64, .implemented = true },
         .sphincs_shake_128f => .{ .pubkey_len = 32, .sig_len = 17088, .verify_mass = 128, .implemented = true },
+        .multisig => Error.UnimplementedScheme, // handled by multisig.verify, not here
         _ => Error.UnknownScheme,
     };
 }
@@ -82,6 +86,7 @@ pub fn verify(tag: SchemeTag, pubkey: []const u8, msg: []const u8, sig: []const 
         // commitment (see primitives/types.zig).
         .sphincs_shake_128f => if (!sphincs.v128f.verify(pubkey, msg, sig)) return Error.InvalidSignature,
         .sphincs_shake_128s => if (!sphincs.v128s.verify(pubkey, msg, sig)) return Error.InvalidSignature,
+        .multisig => return Error.UnimplementedScheme, // nested multisig is not a leaf scheme
         else => return Error.UnimplementedScheme,
     }
 }
