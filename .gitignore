@@ -5,3 +5,8 @@ zig-out/
 
 # Rust reference implementation build artifacts
 refimpl-rs/target/
+
+# TLA+ model checker (build artifact)
+tla2tools.jar
+*.jar
+spec/tla/states/

@@ -1,8 +1,10 @@
 # Finality — specification (v0, Phase-2)
 
-Status: **draft, code-paired.** Source of truth for `consensus/finality.zig`.
-A formal TLA+/Quint safety model is a required follow-up before mainnet; the
-argument below is the standard BFT reasoning the model must discharge.
+Status: **code-paired, safety machine-checked.** Source of truth for
+`consensus/finality.zig`. The quorum-intersection safety argument below is now
+mechanically verified by a TLA+/TLC model — see `spec/tla/` (Byzantine ≤ 1/3:
+no two conflicting cuts finalize, across all reachable states; one fault over
+the threshold produces a counterexample, so the bound is tight).
 
 ## Why a finality gadget
 
