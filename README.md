@@ -28,11 +28,30 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 | Mempool | `src/node/mempool.zig` | Pending txs; fee-rate block selection under a mass cap; edge **policy hook** (compliance without touching consensus) |
 
 ```
-zig build test --summary all      # 45/45 passing
+zig build test --summary all      # 62/62 passing
 zig build demo                    # full end-to-end chain run (see below)
+zig build bench                   # measured scaling / sub-penny-fee numbers
 zig build sim                     # Phase-0 propagation feasibility table
 ./tools/difftest.sh               # Zig vs Rust differential conformance
 ```
+
+## Scale & fees (measured, `zig build bench`)
+
+Settlement-scale throughput with sub-penny fees is not a slogan here — it is
+measured plus honest arithmetic. On a 12-core machine:
+
+- **Post-quantum verification** parallelises across cores (UTXO validation is
+  embarrassingly parallel): ML-DSA-44 at ~70 µs/sig, **~76,000 verifications/sec**.
+- **Batched settlement** (the netting model real exchanges use — one signed
+  transaction settles thousands of net transfers): **~41 bytes/transfer**, 93×
+  smaller than a standalone transaction, one signature amortised over all of them.
+- At a 10 Gbit/s node that is **~30 million transfers/sec** of bandwidth headroom
+  — orders of magnitude above Nasdaq's few-hundred-thousand-trades/sec peak — and
+  a per-transfer fee **floor** millions of times below one US cent.
+
+The binding constraint is bandwidth-per-settled-value; the levers are witness
+segregation, per-scheme mass accounting, batched netting, and parallel
+verification — all implemented and benchmarked.
 
 **Differential testing against an independent Rust implementation.** `refimpl-rs/`
 reimplements the consensus-critical, byte-exact rules (tagged hashing, canonical

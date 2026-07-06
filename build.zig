@@ -62,4 +62,16 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_vectors.addArgs(args);
     const vectors_step = b.step("vectors", "Emit the differential-test vector report");
     vectors_step.dependOn(&run_vectors.step);
+
+    // `zig build bench` — measured scaling benchmark.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_main.zig"),
+        .target = target,
+        .optimize = .ReleaseFast, // measure real throughput
+    });
+    const bench_exe = b.addExecutable(.{ .name = "zigchain-bench", .root_module = bench_mod });
+    b.installArtifact(bench_exe);
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run the scaling benchmark");
+    bench_step.dependOn(&run_bench.step);
 }
