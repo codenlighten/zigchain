@@ -51,6 +51,31 @@ pub const BlockHeader = struct {
         return hashmod.hash(.block_header, list.items);
     }
 
+    pub const max_parents: u32 = 1 << 16;
+
+    pub fn decode(r: *codec.Reader, gpa: std.mem.Allocator) !BlockHeader {
+        const version = try r.readU32();
+        const parent_count = try r.readU32();
+        if (parent_count > max_parents) return codec.ReadError.TooLarge;
+        const parents = try gpa.alloc(Hash256, parent_count);
+        errdefer gpa.free(parents);
+        for (parents) |*p| p.* = try r.readHash();
+        const timestamp = try r.readU64();
+        const merkle_root = try r.readHash();
+        const witness_root = try r.readHash();
+        const bits = try r.readU32();
+        const nonce = try r.readU64();
+        return .{
+            .version = version,
+            .parents = parents,
+            .timestamp = timestamp,
+            .merkle_root = merkle_root,
+            .witness_root = witness_root,
+            .bits = bits,
+            .nonce = nonce,
+        };
+    }
+
     /// The proof-of-work hash (separate domain from the block id, so the PoW
     /// function can be swapped without touching identity hashing).
     pub fn powHash(self: BlockHeader, gpa: std.mem.Allocator) !Hash256 {
@@ -85,6 +110,28 @@ pub const Block = struct {
 
     pub fn id(self: Block, gpa: std.mem.Allocator) !Hash256 {
         return self.header.id(gpa);
+    }
+
+    pub const max_txs: u32 = 1 << 24;
+
+    /// Full block wire encoding: header, then each transaction (body + witnesses).
+    pub fn encode(self: Block, w: *codec.Writer) !void {
+        try self.header.encode(w);
+        try w.writeU32(@intCast(self.txs.len));
+        for (self.txs) |t| {
+            try t.encodeBody(w);
+            try t.encodeWitnesses(w);
+        }
+    }
+
+    pub fn decode(r: *codec.Reader, gpa: std.mem.Allocator) !Block {
+        const header = try BlockHeader.decode(r, gpa);
+        const tx_count = try r.readU32();
+        if (tx_count > max_txs) return codec.ReadError.TooLarge;
+        const txs = try gpa.alloc(Transaction, tx_count);
+        errdefer gpa.free(txs);
+        for (txs) |*t| t.* = try Transaction.decode(r, gpa);
+        return .{ .header = header, .txs = txs };
     }
 
     /// Recompute the merkle root from the block's transactions (by txid).
@@ -256,4 +303,61 @@ test "witness commitment: verifies intact block, detects tampered witness" {
     var tampered = blk;
     tampered.txs = @as([]const tx_mod2.Transaction, &.{tx})[0..1];
     try testing.expect(!try tampered.verifyCommitments(gpa));
+}
+
+test "block wire codec round-trips (header + txs + witnesses)" {
+    const gpa = testing.allocator;
+    const tx_mod2 = @import("types.zig");
+
+    const h0 = [_]u8{ 1, 0, 0, 0, 0, 0, 0, 0 };
+    const cb = tx_mod2.Transaction{
+        .version = 1,
+        .inputs = &.{},
+        .outputs = &.{.{ .value = 50, .scheme = .ml_dsa_44, .commitment = [_]u8{7} ** 32 }},
+        .witnesses = &.{},
+        .payload = &h0,
+    };
+    const spend = tx_mod2.Transaction{
+        .version = 2,
+        .inputs = &.{.{ .outpoint = .{ .txid = [_]u8{9} ** 32, .index = 3 } }},
+        .outputs = &.{.{ .value = 40, .scheme = .ml_dsa_44, .commitment = [_]u8{8} ** 32 }},
+        .witnesses = &.{.{ .scheme = .ml_dsa_44, .pubkey = "abc", .signature = "defg" }},
+    };
+    const original = Block{
+        .header = .{
+            .version = 1,
+            .parents = &.{ [_]u8{0xA1} ** 32, [_]u8{0xB2} ** 32 },
+            .timestamp = 1_700_000_123,
+            .merkle_root = [_]u8{0xCC} ** 32,
+            .witness_root = [_]u8{0xDD} ** 32,
+            .bits = 0x2000ffff,
+            .nonce = 42,
+        },
+        .txs = &.{ cb, spend },
+    };
+
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    var w = codec.Writer{ .list = &list, .gpa = gpa };
+    try original.encode(&w);
+
+    var r = codec.Reader{ .buf = list.items };
+    const decoded = try Block.decode(&r, gpa);
+    defer {
+        gpa.free(decoded.header.parents);
+        for (decoded.txs) |t| {
+            gpa.free(t.inputs);
+            gpa.free(t.outputs);
+            gpa.free(t.witnesses);
+        }
+        gpa.free(decoded.txs);
+    }
+    try r.finish();
+
+    // The decoded block is identical — proven by matching ids and structure.
+    try testing.expectEqualSlices(u8, &(try original.id(gpa)), &(try decoded.id(gpa)));
+    try testing.expectEqual(@as(usize, 2), decoded.txs.len);
+    try testing.expectEqual(@as(u64, 40), decoded.txs[1].outputs[0].value);
+    try testing.expectEqualStrings("abc", decoded.txs[1].witnesses[0].pubkey);
+    try testing.expectEqual(@as(u64, 42), decoded.header.nonce);
 }

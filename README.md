@@ -28,6 +28,7 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 | Finality | `src/core/consensus/finality.zig` | PQ-BFT finality over a DAG cut (spec: `spec/finality.md`) |
 | Processor | `src/core/consensus/processor.zig` | Applies txs in GHOSTDAG order; deterministic cross-anticone double-spend resolution |
 | Mempool | `src/node/mempool.zig` | Pending txs; fee-rate block selection under a mass cap; edge **policy hook** (compliance without touching consensus) |
+| Networking | `src/net/wire.zig` | Length-framed P2P gossip (inv/get_block/block) over raw sockets; block wire codec; real TCP connect/listen |
 
 ```
 zig build test --summary all      # 62/62 passing

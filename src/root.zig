@@ -25,6 +25,7 @@ pub const chain = @import("core/consensus/chain.zig");
 pub const parallel = @import("core/consensus/parallel.zig");
 pub const fees = @import("core/consensus/fees.zig");
 pub const mempool = @import("node/mempool.zig");
+pub const wire = @import("net/wire.zig");
 
 test {
     // Pull every module's tests into the root test binary.
@@ -48,6 +49,7 @@ test {
     _ = parallel;
     _ = fees;
     _ = mempool;
+    _ = wire;
     _ = @import("tests/properties.zig");
     _ = @import("sim/simnet.zig");
 }

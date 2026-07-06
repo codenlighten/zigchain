@@ -22,6 +22,10 @@ const SchemeTag = pq.SchemeTag;
 /// Upper bounds for decode-time allocation safety (consensus-enforced later).
 pub const max_pubkey_len: u32 = 64 * 1024;
 pub const max_sig_len: u32 = 64 * 1024;
+pub const max_inputs: u32 = 1 << 20;
+pub const max_outputs: u32 = 1 << 20;
+pub const max_witnesses: u32 = 1 << 20;
+pub const max_payload_len: u32 = 1 << 20;
 
 pub const OutPoint = struct {
     txid: Hash256,
@@ -114,6 +118,34 @@ pub const Transaction = struct {
     pub fn encodeWitnesses(self: Transaction, w: *codec.Writer) !void {
         try w.writeU32(@intCast(self.witnesses.len));
         for (self.witnesses) |wit| try wit.encode(w);
+    }
+
+    /// Decode a full transaction (body + witnesses). Arrays are allocated with
+    /// `gpa`; variable byte fields reference the reader's buffer, which must
+    /// outlive the returned transaction.
+    pub fn decode(r: *codec.Reader, gpa: std.mem.Allocator) !Transaction {
+        const version = try r.readU32();
+        const in_count = try r.readU32();
+        if (in_count > max_inputs) return codec.ReadError.TooLarge;
+        const inputs = try gpa.alloc(Input, in_count);
+        errdefer gpa.free(inputs);
+        for (inputs) |*i| i.* = try Input.decode(r);
+
+        const out_count = try r.readU32();
+        if (out_count > max_outputs) return codec.ReadError.TooLarge;
+        const outputs = try gpa.alloc(Output, out_count);
+        errdefer gpa.free(outputs);
+        for (outputs) |*o| o.* = try Output.decode(r);
+
+        const payload = try r.readVarBytes(max_payload_len);
+
+        const w_count = try r.readU32();
+        if (w_count > max_witnesses) return codec.ReadError.TooLarge;
+        const witnesses = try gpa.alloc(Witness, w_count);
+        errdefer gpa.free(witnesses);
+        for (witnesses) |*wi| wi.* = try Witness.decode(r);
+
+        return .{ .version = version, .inputs = inputs, .outputs = outputs, .witnesses = witnesses, .payload = payload };
     }
 
     pub fn txid(self: Transaction, gpa: std.mem.Allocator) !Hash256 {
