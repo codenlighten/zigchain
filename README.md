@@ -18,6 +18,8 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 | Primitives | `src/core/primitives/types.zig` | OutPoint/Input/Output/Witness/Transaction, txid/wtxid/sighash, addresses |
 | Block | `src/core/primitives/block.zig` | BlockHeader + block id; promote-odd merkle root (CVE-2012-2459-safe) |
 | UTXO set | `src/core/ledger/utxo.zig` | OutPoint-keyed unspent-output set (sharding-ready interface) |
+| Sharded UTXO | `src/core/ledger/sharded_utxo.zig` | Thread-safe, outpoint-partitioned state (horizontal-scale groundwork) |
+| Accumulator | `src/core/ledger/accumulator.zig` | Utreexo-style hash forest: add/delete/prove + **stateless verify** (bounded state) |
 | Tx validation | `src/core/ledger/validation.zig` | Double-spend, value conservation, PQ-signature auth → fee; connect |
 | DAG | `src/core/consensus/dag.zig` | BlockDAG store + deterministic topological order (hash tie-break) |
 | GHOSTDAG | `src/core/consensus/ghostdag.zig` | k-cluster blue-set coloring, blue score, virtual-chain order (spec: `spec/ghostdag.md`) |

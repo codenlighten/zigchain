@@ -11,6 +11,7 @@ pub const codec = @import("core/serialization/codec.zig");
 pub const primitives = @import("core/primitives/types.zig");
 pub const utxo = @import("core/ledger/utxo.zig");
 pub const sharded_utxo = @import("core/ledger/sharded_utxo.zig");
+pub const accumulator = @import("core/ledger/accumulator.zig");
 pub const validation = @import("core/ledger/validation.zig");
 pub const block_validation = @import("core/ledger/block_validation.zig");
 pub const block = @import("core/primitives/block.zig");
@@ -33,6 +34,7 @@ test {
     _ = primitives;
     _ = utxo;
     _ = sharded_utxo;
+    _ = accumulator;
     _ = validation;
     _ = block_validation;
     _ = block;
