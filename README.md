@@ -29,6 +29,9 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 | Processor | `src/core/consensus/processor.zig` | Applies txs in GHOSTDAG order; deterministic cross-anticone double-spend resolution |
 | Mempool | `src/node/mempool.zig` | Pending txs; fee-rate block selection under a mass cap; edge **policy hook** (compliance without touching consensus) |
 | Networking | `src/net/wire.zig` | Length-framed P2P gossip (inv/get_block/block) over raw sockets; block wire codec; real TCP connect/listen |
+| Persistence | `src/node/store.zig` | Append-only, crash-safe on-disk block log; replay-on-startup |
+| Node | `src/node_main.zig` | Standalone process: TCP peers, gossip, sync, mining, `--datadir` persistence |
+| Finality proof | `spec/tla/` | TLA+/TLC machine-checked safety (quorum intersection; ⅓ bound shown tight) |
 
 ```
 zig build test --summary all      # 76/76 passing
