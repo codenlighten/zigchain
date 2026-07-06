@@ -30,4 +30,5 @@ test {
     _ = ghostdag;
     _ = processor;
     _ = mass;
+    _ = @import("tests/properties.zig");
 }
