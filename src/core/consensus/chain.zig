@@ -22,13 +22,35 @@ const dag_mod = @import("dag.zig");
 const ghostdag = @import("ghostdag.zig");
 const block_validation = @import("../ledger/block_validation.zig");
 const utxo = @import("../ledger/utxo.zig");
+const acc = @import("../ledger/accumulator.zig");
 const processor = @import("processor.zig");
 const hashmod = @import("../crypto/hash.zig");
 
 const Hash256 = hashmod.Hash256;
+const OutPoint = prim.OutPoint;
+const Output = prim.Output;
 const Block = blk.Block;
 const Dag = dag_mod.Dag;
 const Ghostdag = ghostdag.Ghostdag;
+
+/// The accumulator leaf committing to one unspent coin (outpoint + output).
+/// Fixed 77-byte encoding, so no allocation.
+pub fn utxoLeaf(op: OutPoint, out: Output) Hash256 {
+    var buf: [77]u8 = undefined;
+    @memcpy(buf[0..32], &op.txid);
+    std.mem.writeInt(u32, buf[32..36], op.index, .little);
+    std.mem.writeInt(u64, buf[36..44], out.value, .little);
+    buf[44] = @intFromEnum(out.scheme);
+    @memcpy(buf[45..77], &out.commitment);
+    return hashmod.hash(.utxo, &buf);
+}
+
+const Coin = struct { op: OutPoint, out: Output };
+fn lessCoin(_: void, a: Coin, b: Coin) bool {
+    const ord = std.mem.order(u8, &a.op.txid, &b.op.txid);
+    if (ord != .eq) return ord == .lt;
+    return a.op.index < b.op.index;
+}
 
 pub const Config = struct {
     genesis_bits: u32 = pow.easy_bits,
@@ -167,6 +189,38 @@ pub const Chain = struct {
         errdefer set.deinit(self.gpa);
         _ = try processor.applyOrder(self.gpa, &set, &self.gd.?, items.items);
         return set;
+    }
+
+    /// Build the UTXO accumulator (a Utreexo forest) over the current committed
+    /// state. Coins are inserted in canonical outpoint order so the resulting
+    /// roots — and hence the commitment — are deterministic. Caller deinits.
+    pub fn buildAccumulator(self: *Chain) Error!acc.Forest {
+        var set = try self.utxoSet();
+        defer set.deinit(self.gpa);
+
+        var coins: std.ArrayList(Coin) = .empty;
+        defer coins.deinit(self.gpa);
+        var it = set.map.iterator();
+        while (it.next()) |e| try coins.append(self.gpa, .{ .op = e.key_ptr.*, .out = e.value_ptr.* });
+        std.mem.sort(Coin, coins.items, {}, lessCoin);
+
+        var f = acc.Forest.init(self.gpa);
+        errdefer f.deinit();
+        for (coins.items) |c| try f.add(utxoLeaf(c.op, c.out));
+        return f;
+    }
+
+    /// A single hash committing to the entire UTXO state (over the accumulator
+    /// roots). This is what a block header would commit to, and what a stateless
+    /// node checks proofs against. Deterministic for a given DAG.
+    pub fn utxoCommitment(self: *Chain) Error!Hash256 {
+        var f = try self.buildAccumulator();
+        defer f.deinit();
+        const roots = try f.rootHashes(self.gpa);
+        defer self.gpa.free(roots);
+        var h = hashmod.Hasher.init(.utxo);
+        for (roots) |r| h.update(&r);
+        return h.final();
     }
 };
 
@@ -425,4 +479,48 @@ test "difficulty adjusts: fast blocks raise difficulty past the window" {
     // With the window now full of fast blocks, the DAA demands harder difficulty.
     const now_bits = chain.expectedBits(&.{prev});
     try testing.expect(pow.compactToTarget(now_bits) < pow.compactToTarget(genesis_bits));
+}
+
+test "chain commits to UTXO state; a coin proves statelessly against it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var chain = Chain.init(testing.allocator, .{});
+    defer chain.deinit();
+
+    const genesis = try mineBlock(arena, &chain, &.{}, 1000, &.{}, hashmod.zero);
+    var prev = try chain.acceptBlock(genesis);
+    var ts: u64 = 2000;
+    for (0..3) |_| {
+        prev = try chain.acceptBlock(try mineBlock(arena, &chain, &.{prev}, ts, &.{}, hashmod.zero));
+        ts += 1000;
+    }
+
+    // The state commitment is deterministic.
+    const c1 = try chain.utxoCommitment();
+    const c2 = try chain.utxoCommitment();
+    try testing.expectEqualSlices(u8, &c1, &c2);
+
+    // Prove the genesis coinbase coin against the accumulator roots — statelessly.
+    const cb = genesis.txs[0];
+    const cb_id = try cb.txid(arena);
+    const coin_op = OutPoint{ .txid = cb_id, .index = 0 };
+    const leaf = utxoLeaf(coin_op, cb.outputs[0]);
+
+    var f = try chain.buildAccumulator();
+    defer f.deinit();
+    const roots = try f.rootHashes(testing.allocator);
+    defer testing.allocator.free(roots);
+
+    const proof = (try f.prove(testing.allocator, leaf)).?;
+    defer testing.allocator.free(proof);
+    try testing.expect(acc.verify(roots, leaf, proof));
+
+    // A coin that does not exist cannot be proven, and a real proof does not
+    // validate a different (forged) coin.
+    const fake_op = OutPoint{ .txid = [_]u8{0xFF} ** 32, .index = 0 };
+    const fake_leaf = utxoLeaf(fake_op, cb.outputs[0]);
+    try testing.expect((try f.prove(testing.allocator, fake_leaf)) == null);
+    try testing.expect(!acc.verify(roots, fake_leaf, proof));
 }
