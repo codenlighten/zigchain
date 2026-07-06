@@ -47,10 +47,14 @@ pub fn validateStateless(gpa: std.mem.Allocator, block: Block, cfg: Config) Erro
         if (t.isCoinbase()) return Error.MultipleCoinbase;
     }
 
-    // Coinbase payload must encode the block height (little-endian u64).
+    // Coinbase payload must BEGIN with the block height (little-endian u64).
+    // Any trailing bytes are a miner extranonce — required because height is not
+    // unique in a DAG (parallel blocks share a height), so the extranonce is
+    // what keeps sibling coinbase txids distinct.
+    if (coinbase.payload.len < 8) return Error.BadCoinbaseHeight;
     var height_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &height_bytes, cfg.height, .little);
-    if (!std.mem.eql(u8, coinbase.payload, &height_bytes)) return Error.BadCoinbaseHeight;
+    if (!std.mem.eql(u8, coinbase.payload[0..8], &height_bytes)) return Error.BadCoinbaseHeight;
 
     // Commitments must match the body.
     const mr = try block.computeMerkleRoot(gpa);

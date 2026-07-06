@@ -187,8 +187,11 @@ fn mineBlock(
     cb_commitment: Hash256,
 ) !Block {
     const height = chain.heightOf(parents);
-    const payload = arena.alloc(u8, 8) catch unreachable;
+    // payload = height (committed) ++ timestamp as extranonce, so sibling
+    // coinbases at the same height still get distinct txids.
+    const payload = arena.alloc(u8, 16) catch unreachable;
     std.mem.writeInt(u64, payload[0..8], height, .little);
+    std.mem.writeInt(u64, payload[8..16], timestamp, .little);
 
     const cb = prim.Transaction{
         .version = 1,
@@ -310,6 +313,92 @@ test "chain rejects a coinbase with the wrong height" {
     _ = try hdr.mine(arena, 10_000_000);
     const wrong = Block{ .header = hdr, .txs = body.txs };
     try testing.expectError(block_validation.Error.BadCoinbaseHeight, chain.acceptBlock(wrong));
+}
+
+/// A random valid insertion order (topological) over parents-by-index.
+fn randomTopo(arena: std.mem.Allocator, rng: std.Random, parents_idx: []const []u32) ![]u32 {
+    const n = parents_idx.len;
+    const inserted = try arena.alloc(bool, n);
+    @memset(inserted, false);
+    var order: std.ArrayList(u32) = .empty;
+    var cands: std.ArrayList(u32) = .empty;
+    while (order.items.len < n) {
+        cands.clearRetainingCapacity();
+        for (0..n) |i| {
+            if (inserted[i]) continue;
+            var ready = true;
+            for (parents_idx[i]) |p| {
+                if (!inserted[p]) {
+                    ready = false;
+                    break;
+                }
+            }
+            if (ready) try cands.append(arena, @intCast(i));
+        }
+        const pick = cands.items[rng.intRangeLessThan(usize, 0, cands.items.len)];
+        inserted[pick] = true;
+        try order.append(arena, pick);
+    }
+    return order.toOwnedSlice(arena);
+}
+
+test "property: block arrival order does not change the resulting state" {
+    var seed: u64 = 0;
+    while (seed < 12) : (seed += 1) {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const n = rng.intRangeAtMost(u32, 1, 7);
+
+        // Random DAG structure: parents_idx[i] are indices < i.
+        const parents_idx = try arena.alloc([]u32, n);
+        for (0..n) |i| {
+            if (i == 0) {
+                parents_idx[i] = try arena.alloc(u32, 0);
+                continue;
+            }
+            const maxp = @min(@as(u32, @intCast(i)), 3);
+            const cnt = rng.intRangeAtMost(u32, 1, maxp);
+            var chosen: std.ArrayList(u32) = .empty;
+            while (chosen.items.len < cnt) {
+                const c = rng.intRangeLessThan(u32, 0, @intCast(i));
+                if (std.mem.indexOfScalar(u32, chosen.items, c) == null) try chosen.append(arena, c);
+            }
+            parents_idx[i] = try chosen.toOwnedSlice(arena);
+        }
+
+        // Build chain1 in index order (which is topological), collecting blocks.
+        var chain1 = Chain.init(testing.allocator, .{});
+        defer chain1.deinit();
+        const blocks = try arena.alloc(Block, n);
+        const ids = try arena.alloc(Hash256, n);
+        for (0..n) |i| {
+            const ps = try arena.alloc(Hash256, parents_idx[i].len);
+            for (parents_idx[i], 0..) |pi, j| ps[j] = ids[pi];
+            blocks[i] = try mineBlock(arena, &chain1, ps, 1000 + i, &.{}, hashmod.zero);
+            ids[i] = try chain1.acceptBlock(blocks[i]);
+        }
+        const tip1 = chain1.tip().?;
+        var set1 = try chain1.utxoSet();
+        defer set1.deinit(testing.allocator);
+
+        // Accept the identical blocks into chain2 in a different topological order.
+        const order = try randomTopo(arena, rng, parents_idx);
+        var chain2 = Chain.init(testing.allocator, .{});
+        defer chain2.deinit();
+        for (order) |i| _ = try chain2.acceptBlock(blocks[i]);
+        const tip2 = chain2.tip().?;
+        var set2 = try chain2.utxoSet();
+        defer set2.deinit(testing.allocator);
+
+        // Same tip, same ledger — arrival order is irrelevant.
+        try testing.expectEqualSlices(u8, &tip1, &tip2);
+        try testing.expectEqual(set1.count(), set2.count());
+        // Supply conservation: each block minted exactly one coinbase output.
+        try testing.expectEqual(@as(usize, n), set1.count());
+    }
 }
 
 test "difficulty adjusts: fast blocks raise difficulty past the window" {
