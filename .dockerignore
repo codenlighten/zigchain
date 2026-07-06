@@ -1,0 +1,9 @@
+.git
+.gitignore
+.zig-cache
+zig-out
+refimpl-rs/target
+**/*.jar
+spec/tla/states
+*.md
+!README.md

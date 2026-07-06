@@ -286,7 +286,8 @@ fn listen(node: *Node, port: u16) void {
 
 fn mineLoop(node: *Node, target: usize) void {
     var seq: u64 = 0;
-    while (!node.stop.load(.acquire) and node.blockCount() < target) {
+    // target == 0 means "run forever" (daemon mode).
+    while (!node.stop.load(.acquire) and (target == 0 or node.blockCount() < target)) {
         node.lock.lock();
         var pbuf: [1]Hash256 = undefined;
         const parents: []const Hash256 = if (node.chain.tip()) |t| p: {
@@ -345,7 +346,7 @@ pub fn main(init: std.process.Init) !void {
 
     var port: u16 = 0;
     var mine = false;
-    var target: usize = 6;
+    var target: usize = 0; // 0 = run forever (daemon); demos/tests pass --blocks N
     var name: []const u8 = "node";
     var serve_secs: u64 = 0;
     var datadir: ?[]const u8 = null;
@@ -398,15 +399,24 @@ pub fn main(init: std.process.Init) !void {
     }
     sleepMs(300);
 
+    // A daemon (no --blocks target) runs until killed; otherwise it stops at a
+    // target block height (used by demos and integration tests).
+    const daemon = target == 0;
+
     if (mine) {
-        mineLoop(node, target);
+        mineLoop(node, target); // target 0 = mine forever
+    } else if (daemon) {
+        node.log("running as a daemon (serving/syncing); Ctrl-C to stop", .{});
+        while (!node.stop.load(.acquire)) sleepMs(1000);
     } else {
         // Wait until we've synced `target` blocks (or time out).
         const deadline = nowNs() + 30 * std.time.ns_per_s;
         while (node.blockCount() < target and nowNs() < deadline) sleepMs(100);
     }
 
-    // Give gossip a moment to settle, then report final state.
+    if (daemon) return; // never reached in practice; the loops above run forever
+
+    // Bounded run: give gossip a moment to settle, then report final state.
     sleepMs(800);
     node.lock.lock();
     const tip = node.chain.tip();

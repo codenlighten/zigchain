@@ -45,6 +45,17 @@ zig build node -- --port 9101 --name B --blocks 5              # in one terminal
 zig build node -- --port 9100 --peer 127.0.0.1:9101 --mine --blocks 5 --name A
 ```
 
+## Deploy
+
+**One-click on AWS** — [![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home#/stacks/create/review?templateURL=https://raw.githubusercontent.com/codenlighten/zigchain/main/deploy/aws/cloudformation.yaml&stackName=zigchain) launches a self-restarting, persistent node (see [`deploy/aws/`](deploy/aws/)).
+
+**Docker anywhere** — a ~9 MB statically-linked image:
+
+```
+docker build -t zigchain .
+docker run -d --restart unless-stopped -p 9000:9000 -v zigchain-data:/data -e ZIGCHAIN_MINE=true zigchain
+```
+
 ## Scale & fees (measured, `zig build bench`)
 
 Settlement-scale throughput with sub-penny fees is not a slogan here — it is

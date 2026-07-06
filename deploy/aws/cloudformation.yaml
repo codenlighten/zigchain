@@ -1,0 +1,115 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ZigChain node — single-click deploy. Launches an EC2 instance that builds the
+  node from source into a container and runs it as a self-restarting service,
+  with a persistent block log. Mine a fresh chain, or join an existing network
+  by pointing SeedPeer at a running node.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large, t3.xlarge, c7i.large, c7i.xlarge]
+    Description: EC2 instance type. Mining is CPU-bound; t3.medium+ recommended.
+  P2PPort:
+    Type: Number
+    Default: 9000
+    MinValue: 1024
+    MaxValue: 65535
+    Description: TCP port the node listens on for peers.
+  Mine:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Whether this node mines blocks.
+  SeedPeer:
+    Type: String
+    Default: ""
+    Description: >
+      Optional peer to join, as ip:port (e.g. 1.2.3.4:9000). Leave blank to
+      start a new chain.
+  KeyName:
+    Type: String
+    Default: ""
+    Description: Optional existing EC2 key pair name, to enable SSH.
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR allowed to SSH (only used if a key pair is given). Restrict this.
+  RootVolumeSizeGb:
+    Type: Number
+    Default: 20
+    MinValue: 8
+    Description: Root EBS volume size (holds the block log).
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, ""]]
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ZigChain node — P2P and (optional) SSH
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref P2PPort
+          ToPort: !Ref P2PPort
+          CidrIp: 0.0.0.0/0
+          Description: ZigChain P2P
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+          Description: SSH
+
+  Node:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      SecurityGroupIds: [!GetAtt SecurityGroup.GroupId]
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref "AWS::NoValue"]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref RootVolumeSizeGb
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: zigchain-node
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf update -y
+          dnf install -y docker git
+          systemctl enable --now docker
+          cd /root
+          git clone https://github.com/codenlighten/zigchain.git
+          cd zigchain
+          docker build -t zigchain .
+          docker volume create zigchain-data
+          docker run -d --name zigchain --restart unless-stopped \
+            -p ${P2PPort}:${P2PPort} \
+            -v zigchain-data:/data \
+            -e ZIGCHAIN_PORT=${P2PPort} \
+            -e ZIGCHAIN_MINE=${Mine} \
+            -e ZIGCHAIN_PEER=${SeedPeer} \
+            zigchain
+          # Log the container's status for `aws ec2 get-console-output`.
+          sleep 5 && docker logs zigchain || true
+
+Outputs:
+  PublicIp:
+    Description: Public IP of the node.
+    Value: !GetAtt Node.PublicIp
+  P2PEndpoint:
+    Description: This node's peer endpoint.
+    Value: !Sub "${Node.PublicIp}:${P2PPort}"
+  JoinCommand:
+    Description: How another node joins this one.
+    Value: !Sub "zig build node -- --peer ${Node.PublicIp}:${P2PPort}"
+  SSHCommand:
+    Condition: HasKeyName
+    Description: SSH to the instance (then `docker logs -f zigchain`).
+    Value: !Sub "ssh ec2-user@${Node.PublicIp}"
