@@ -231,8 +231,10 @@ pub const Chain = struct {
 const testing = std.testing;
 
 /// Mine a block that the chain will accept: correct parents, DAA difficulty,
-/// coinbase carrying the right height, and a valid nonce.
-fn mineBlock(
+/// coinbase carrying the right height, and a valid nonce. Public so nodes,
+/// tests, and demos can construct valid blocks. Block memory is drawn from
+/// `arena` and must outlive its use by the chain.
+pub fn mineBlock(
     arena: std.mem.Allocator,
     chain: *Chain,
     parents: []const Hash256,
@@ -523,4 +525,57 @@ test "chain commits to UTXO state; a coin proves statelessly against it" {
     const fake_leaf = utxoLeaf(fake_op, cb.outputs[0]);
     try testing.expect((try f.prove(testing.allocator, fake_leaf)) == null);
     try testing.expect(!acc.verify(roots, fake_leaf, proof));
+}
+
+fn acceptAll(nodes: []Chain, block: Block) !void {
+    for (nodes) |*n| {
+        _ = n.acceptBlock(block) catch |e| switch (e) {
+            error.DuplicateBlock => {},
+            else => return e,
+        };
+    }
+}
+
+test "multi-node: concurrent mining forks then converges on all nodes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var nodes = [_]Chain{
+        Chain.init(testing.allocator, .{}),
+        Chain.init(testing.allocator, .{}),
+        Chain.init(testing.allocator, .{}),
+    };
+    defer for (&nodes) |*n| n.deinit();
+
+    // Node 0 mines genesis; everyone accepts (gossip).
+    const g = try mineBlock(arena, &nodes[0], &.{}, 1000, &.{}, hashmod.zero);
+    try acceptAll(&nodes, g);
+    const gid = try g.header.id(arena);
+
+    // Nodes 1 and 2 mine CONCURRENTLY on the same tip — a natural fork. Both
+    // blocks propagate to everyone, so all nodes now hold a 2-tip DAG.
+    const b1 = try mineBlock(arena, &nodes[1], &.{gid}, 2000, &.{}, hashmod.zero);
+    const b2 = try mineBlock(arena, &nodes[2], &.{gid}, 2001, &.{}, hashmod.zero);
+    try acceptAll(&nodes, b1);
+    try acceptAll(&nodes, b2);
+
+    // Node 0 mines a block merging the fork; everyone accepts.
+    const id1 = try b1.header.id(arena);
+    const id2 = try b2.header.id(arena);
+    const m = try mineBlock(arena, &nodes[0], &.{ id1, id2 }, 3000, &.{}, hashmod.zero);
+    try acceptAll(&nodes, m);
+
+    // Convergence: every node agrees on the selected tip AND the full UTXO
+    // state commitment — despite different mining and gossip participation.
+    const tip0 = nodes[0].tip().?;
+    const commit0 = try nodes[0].utxoCommitment();
+    for (&nodes) |*n| {
+        try testing.expectEqualSlices(u8, &tip0, &n.tip().?);
+        try testing.expectEqualSlices(u8, &commit0, &(try n.utxoCommitment()));
+    }
+    // 4 coinbases minted (genesis, b1, b2, merge), all unspent.
+    var set = try nodes[0].utxoSet();
+    defer set.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), set.count());
 }
