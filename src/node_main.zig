@@ -48,11 +48,15 @@ const Peer = struct {
     send: SpinLock = .{},
 };
 
+/// A block received before its parents — held until they arrive.
+const Orphan = struct { bytes: []u8, parents: []Hash256 };
+
 const Node = struct {
     gpa: std.mem.Allocator,
     chain: chain.Chain,
-    lock: SpinLock = .{}, // guards chain + peers
+    lock: SpinLock = .{}, // guards chain + peers + orphans
     peers: std.ArrayList(*Peer) = .empty,
+    orphans: std.AutoHashMapUnmanaged(Hash256, Orphan) = .empty,
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     name: []const u8,
 
@@ -99,7 +103,16 @@ fn sendOne(node: *Node, peer: *Peer, msg: wire.Message) void {
     peer.send.unlock();
 }
 
+/// Announce our current tip so a peer can begin syncing from it.
+fn sendTipInv(node: *Node, peer: *Peer) void {
+    node.lock.lock();
+    const tip = node.chain.tip();
+    node.lock.unlock();
+    if (tip) |t| sendOne(node, peer, .{ .inv = t });
+}
+
 fn handleConn(node: *Node, peer: *Peer) void {
+    sendTipInv(node, peer); // let a joining peer start pulling history
     while (!node.stop.load(.acquire)) {
         const r = wire.recvMessage(peer.fd, node.gpa) catch break;
         defer node.gpa.free(r.buffer);
@@ -127,37 +140,94 @@ fn handleConn(node: *Node, peer: *Peer) void {
 }
 
 fn processBlock(node: *Node, from: *Peer, bytes: []const u8) void {
+    var requests: std.ArrayList(Hash256) = .empty;
+    defer requests.deinit(node.gpa);
+    var to_flood: ?[]u8 = null;
+
     node.lock.lock();
-    // Persist the bytes; the chain borrows the decoded block's memory.
-    const owned = node.gpa.dupe(u8, bytes) catch {
-        node.lock.unlock();
-        return;
-    };
+    ingest(node, bytes, &requests, &to_flood);
+    node.lock.unlock();
+
+    // Fetch any missing ancestors from the peer that sent this (walks history back).
+    for (requests.items) |pid| sendOne(node, from, .{ .get_block = pid });
+    // Re-flood a newly-accepted block to the other peers.
+    if (to_flood) |fb| broadcastBlock(node, fb, from.fd);
+}
+
+/// Ingest a block (caller holds the lock). Accepts it if its parents are present;
+/// otherwise stashes it as an orphan and records the missing parents to request.
+/// Accepting a block cascades: any orphan now connectable is accepted too.
+fn ingest(node: *Node, bytes: []const u8, requests: *std.ArrayList(Hash256), to_flood: *?[]u8) void {
+    const owned = node.gpa.dupe(u8, bytes) catch return;
     var reader = codec.Reader{ .buf = owned };
     const block = Block.decode(&reader, node.gpa) catch {
         node.gpa.free(owned);
-        node.lock.unlock();
         return;
     };
     const id = block.header.id(node.gpa) catch {
-        node.lock.unlock();
+        node.gpa.free(owned);
         return;
     };
-    if (node.chain.dag.contains(id)) {
+    if (node.chain.dag.contains(id) or node.orphans.contains(id)) {
         node.gpa.free(owned);
-        node.lock.unlock();
         return;
     }
-    const accepted = if (node.chain.acceptBlock(block)) |_| true else |_| false;
-    const count = node.chain.dag.count();
-    node.lock.unlock();
 
-    if (accepted) {
-        node.log("accepted block over the wire (chain now {d} blocks)", .{count});
-        broadcastBlock(node, owned, from.fd); // flood to other peers
+    var missing = false;
+    for (block.header.parents) |p| {
+        if (!node.chain.dag.contains(p)) {
+            missing = true;
+            requests.append(node.gpa, p) catch {};
+        }
     }
-    // On failure (invalid / unknown-parent) we simply drop it; over ordered TCP
-    // with a single miner, parents always precede children so this is rare.
+    if (missing) {
+        const parents_copy = node.gpa.dupe(Hash256, block.header.parents) catch {
+            node.gpa.free(owned);
+            return;
+        };
+        node.orphans.put(node.gpa, id, .{ .bytes = owned, .parents = parents_copy }) catch {};
+        return;
+    }
+
+    _ = node.chain.acceptBlock(block) catch {
+        node.gpa.free(owned);
+        return;
+    };
+    node.log("accepted block (chain now {d})", .{node.chain.dag.count()});
+    to_flood.* = owned;
+    cascade(node);
+}
+
+/// Connect every orphan whose parents are now present, repeatedly.
+fn cascade(node: *Node) void {
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var ready: ?Hash256 = null;
+        var it = node.orphans.iterator();
+        while (it.next()) |e| {
+            var all = true;
+            for (e.value_ptr.parents) |p| {
+                if (!node.chain.dag.contains(p)) {
+                    all = false;
+                    break;
+                }
+            }
+            if (all) {
+                ready = e.key_ptr.*;
+                break;
+            }
+        }
+        if (ready) |rid| {
+            const orph = node.orphans.fetchRemove(rid).?.value;
+            node.gpa.free(orph.parents);
+            var rd = codec.Reader{ .buf = orph.bytes };
+            const b = Block.decode(&rd, node.gpa) catch continue;
+            _ = node.chain.acceptBlock(b) catch continue;
+            node.log("connected orphan (chain now {d})", .{node.chain.dag.count()});
+            changed = true;
+        }
+    }
 }
 
 fn listen(node: *Node, port: u16) void {
@@ -230,6 +300,7 @@ pub fn main(init: std.process.Init) !void {
     var mine = false;
     var target: usize = 6;
     var name: []const u8 = "node";
+    var serve_secs: u64 = 0;
     var peer_addrs: std.ArrayList(PeerAddr) = .empty;
     defer peer_addrs.deinit(gpa);
 
@@ -244,6 +315,8 @@ pub fn main(init: std.process.Init) !void {
             target = std.fmt.parseInt(usize, args.next() orelse "6", 10) catch 6;
         } else if (std.mem.eql(u8, arg, "--name")) {
             name = args.next() orelse "node";
+        } else if (std.mem.eql(u8, arg, "--serve-secs")) {
+            serve_secs = std.fmt.parseInt(u64, args.next() orelse "0", 10) catch 0;
         }
     }
 
@@ -287,6 +360,12 @@ pub fn main(init: std.process.Init) !void {
         });
     } else {
         node.log("FINAL: no blocks", .{});
+    }
+
+    // Keep serving history/gossip to peers (e.g. late joiners) before exiting.
+    if (serve_secs > 0) {
+        node.log("serving peers for {d}s...", .{serve_secs});
+        sleepMs(serve_secs * 1000);
     }
     node.stop.store(true, .release);
 }
