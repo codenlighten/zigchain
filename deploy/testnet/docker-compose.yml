@@ -1,0 +1,73 @@
+# A multi-node ZigChain testnet on an isolated bridge network. Each node runs in
+# its own container with its OWN IP (172.28.0.1x), so this exercises the real
+# multi-host paths that a loopback test cannot: getpeername returns distinct
+# routable IPs, the address-book routable() filter, self-connection detection by
+# nonce, and peer exchange across real addresses.
+#
+# Topology: `seed` mines; every peer is told ONLY about the seed and must learn
+# the others via PEX. Build the image first (the harness does this):
+#   docker build -t zigchain:testnet ../..
+name: zigchain-testnet
+
+x-peer: &peer
+  image: zigchain:testnet
+  depends_on: [seed]
+  restart: unless-stopped
+  environment: &peerenv
+    ZIGCHAIN_PORT: "9000"
+    ZIGCHAIN_PEER: "172.28.0.10:9000" # knows only the seed; discovers the rest via PEX
+
+services:
+  seed:
+    image: zigchain:testnet
+    restart: unless-stopped
+    environment:
+      ZIGCHAIN_PORT: "9000"
+      ZIGCHAIN_MINE: "true"
+      ZIGCHAIN_NAME: "seed"
+    networks:
+      testnet:
+        ipv4_address: 172.28.0.10
+
+  peer1:
+    <<: *peer
+    environment:
+      <<: *peerenv
+      ZIGCHAIN_NAME: "peer1"
+    networks:
+      testnet:
+        ipv4_address: 172.28.0.11
+
+  peer2:
+    <<: *peer
+    environment:
+      <<: *peerenv
+      ZIGCHAIN_NAME: "peer2"
+    networks:
+      testnet:
+        ipv4_address: 172.28.0.12
+
+  peer3:
+    <<: *peer
+    environment:
+      <<: *peerenv
+      ZIGCHAIN_NAME: "peer3"
+    networks:
+      testnet:
+        ipv4_address: 172.28.0.13
+
+  peer4:
+    <<: *peer
+    environment:
+      <<: *peerenv
+      ZIGCHAIN_NAME: "peer4"
+    networks:
+      testnet:
+        ipv4_address: 172.28.0.14
+
+networks:
+  testnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

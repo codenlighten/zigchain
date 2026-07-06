@@ -187,6 +187,22 @@ pub const Chain = struct {
         return (self.gd orelse return null).selectedTip();
     }
 
+    /// The selected-chain block at (or just below) absolute height `h`, found by
+    /// walking selected-parents back from the tip. Two nodes following the same
+    /// chain return the SAME block for the same `h` even while their live tips
+    /// differ under continuous mining — so a rounded-down common height gives a
+    /// robust convergence signal for a running network.
+    pub fn selectedBlockAtHeight(self: *const Chain, h: u64) ?Hash256 {
+        const gd = self.gd orelse return null;
+        var cur = gd.selectedTip() orelse return null;
+        while (true) {
+            const ch = self.height(cur) orelse return cur;
+            if (ch <= h) return cur;
+            const d = gd.get(cur) orelse return cur;
+            cur = d.selected_parent orelse return cur; // reached genesis
+        }
+    }
+
     pub fn height(self: *const Chain, id: Hash256) ?u64 {
         return self.heights.get(id);
     }

@@ -56,6 +56,14 @@ docker build -t zigchain .
 docker run -d --restart unless-stopped -p 9000:9000 -v zigchain-data:/data -e ZIGCHAIN_MINE=true zigchain
 ```
 
+**Multi-node testnet** — a harness that runs 5 nodes, each with its own container
+IP, and asserts convergence, PEX discovery across real IPs, and fault recovery
+(see [`deploy/testnet/`](deploy/testnet/)):
+
+```
+deploy/testnet/testnet.sh
+```
+
 ## Custody
 
 Air-gapped, post-quantum key custody with HD derivation and offline signing for

@@ -60,6 +60,7 @@ const max_drop_strikes: u32 = 4096; // consecutive rate-limited drops before dis
 const discovery_interval_ms: u64 = 2000;
 const dial_cooldown_ms: u64 = 30_000; // minimum interval between dial attempts to one address
 const max_ip_buckets: usize = 65536; // cap on distinct source-IP rate-limit buckets
+const status_ckpt_interval: u64 = 50; // STATUS reports the selected block at this height granularity
 
 const NetAddr = wire.NetAddr;
 
@@ -457,6 +458,36 @@ fn discover(node: *Node) void {
     }
 }
 
+/// Periodically log a one-line status so an external harness (or `docker logs`)
+/// can observe convergence and peer counts without an RPC interface.
+fn statusLoop(node: *Node) void {
+    while (!node.stop.load(.acquire)) {
+        sleepMs(3000);
+        node.lock.lock();
+        const tip = node.chain.tip();
+        // The selected tip's height, and a checkpoint block at a rounded-down
+        // absolute height that peers on the same chain all agree on.
+        const tip_h: u64 = if (tip) |t| (node.chain.height(t) orelse 0) else 0;
+        const ckpt: u64 = (tip_h / status_ckpt_interval) * status_ckpt_interval;
+        const stable = node.chain.selectedBlockAtHeight(ckpt);
+        node.lock.unlock();
+        node.net_lock.lock();
+        const npeers = node.peers.items.len;
+        node.net_lock.unlock();
+        if (tip) |t| {
+            node.log("STATUS height={d} ckpt={d} peers={d} tip={s} stable={s}", .{
+                tip_h,
+                ckpt,
+                npeers,
+                std.fmt.bytesToHex(t, .lower)[0..12],
+                std.fmt.bytesToHex(stable orelse hashmod.zero, .lower)[0..12],
+            });
+        } else {
+            node.log("STATUS height=0 ckpt=0 peers={d} tip=none stable=none", .{npeers});
+        }
+    }
+}
+
 fn mineLoop(node: *Node, target: usize) void {
     var seq: u64 = 0;
     // target == 0 means "run forever" (daemon mode).
@@ -656,6 +687,7 @@ pub fn main(init: std.process.Init) !void {
     // Discover further peers via PEX (needs a listener so discovered peers can
     // reach us back).
     if (port > 0) _ = try std.Thread.spawn(.{}, discover, .{node});
+    _ = std.Thread.spawn(.{}, statusLoop, .{node}) catch {};
     sleepMs(300);
 
     // A daemon (no --blocks target) runs until killed; otherwise it stops at a
