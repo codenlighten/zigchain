@@ -24,8 +24,18 @@ Phase 1 foundation (single-node core primitives), all dependency-free and tested
 | Processor | `src/core/consensus/processor.zig` | Applies txs in GHOSTDAG order; deterministic cross-anticone double-spend resolution |
 
 ```
-zig build test --summary all      # 28/28 passing
+zig build test --summary all      # 37/37 passing
+zig build sim                     # Phase-0 propagation feasibility table
 ```
+
+**Phase-0 propagation feasibility** (`src/sim/simnet.zig`) — a discrete-event
+gossip sim feeds real DAGs through the actual GHOSTDAG coloring and measures the
+orphan (red) rate. At 100 Mbit/s links it confirms the central design tension in
+hard numbers: small blocks tolerate 20+ blocks/s at ~0% orphans, but 4 MB
+PQ-fat blocks collapse the DAG (≈30% orphaned at 10/s, ≈59% at 20/s). The
+feasible envelope is *high block rate OR big blocks, not both* — throughput
+comes from block size × parallel validation × relay efficiency, at a
+deliberately conservative block rate, exactly as the plan assumes.
 
 **Phase-1 goal reached:** a DAG of post-quantum-signed transactions is colored by
 GHOSTDAG, linearized, and applied to the UTXO set — with double-spends across

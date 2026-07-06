@@ -31,4 +31,5 @@ test {
     _ = processor;
     _ = mass;
     _ = @import("tests/properties.zig");
+    _ = @import("sim/simnet.zig");
 }
