@@ -160,6 +160,26 @@ fn socketpair() ![2]i32 {
     return fds;
 }
 
+test "oversized and empty frames are rejected (DoS guard)" {
+    const gpa = testing.allocator;
+    const fds = try socketpair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    // A hostile length prefix claiming more than max_frame must be refused
+    // BEFORE any body is read, so a peer cannot force a huge allocation.
+    var big: [4]u8 = undefined;
+    std.mem.writeInt(u32, &big, max_frame + 1, .little);
+    try writeAll(fds[0], &big);
+    try testing.expectError(Error.BadFrame, recvMessage(fds[1], gpa));
+
+    // A zero-length frame is also rejected.
+    var zero: [4]u8 = undefined;
+    std.mem.writeInt(u32, &zero, 0, .little);
+    try writeAll(fds[0], &zero);
+    try testing.expectError(Error.BadFrame, recvMessage(fds[1], gpa));
+}
+
 test "message framing round-trips over a real socket" {
     const gpa = testing.allocator;
     const fds = try socketpair();

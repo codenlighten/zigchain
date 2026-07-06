@@ -44,6 +44,10 @@ fn sleepMs(ms: u64) void {
     _ = linux.nanosleep(&ts, null);
 }
 
+// DoS bounds for a node facing untrusted peers.
+const max_peers: usize = 128;
+const max_orphans: usize = 8192;
+
 const Peer = struct {
     fd: i32,
     send: SpinLock = .{},
@@ -74,7 +78,18 @@ const Node = struct {
 };
 
 fn addPeer(node: *Node, fd: i32) void {
-    const peer = node.gpa.create(Peer) catch return;
+    node.lock.lock();
+    const full = node.peers.items.len >= max_peers;
+    node.lock.unlock();
+    if (full) {
+        _ = linux.close(fd);
+        node.log("peer limit ({d}) reached; dropped connection", .{max_peers});
+        return;
+    }
+    const peer = node.gpa.create(Peer) catch {
+        _ = linux.close(fd);
+        return;
+    };
     peer.* = .{ .fd = fd };
     node.lock.lock();
     node.peers.append(node.gpa, peer) catch {};
@@ -183,6 +198,12 @@ fn ingest(node: *Node, bytes: []const u8, requests: *std.ArrayList(Hash256), to_
         }
     }
     if (missing) {
+        // Bound the orphan pool so a peer can't exhaust memory with blocks whose
+        // parents never arrive.
+        if (node.orphans.count() >= max_orphans) {
+            node.gpa.free(owned);
+            return;
+        }
         const parents_copy = node.gpa.dupe(Hash256, block.header.parents) catch {
             node.gpa.free(owned);
             return;
