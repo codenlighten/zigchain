@@ -14,6 +14,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const wire = @import("net/wire.zig");
+const store_mod = @import("node/store.zig");
 const chain = @import("core/consensus/chain.zig");
 const blk = @import("core/primitives/block.zig");
 const hashmod = @import("core/crypto/hash.zig");
@@ -57,6 +58,7 @@ const Node = struct {
     lock: SpinLock = .{}, // guards chain + peers + orphans
     peers: std.ArrayList(*Peer) = .empty,
     orphans: std.AutoHashMapUnmanaged(Hash256, Orphan) = .empty,
+    store: ?store_mod.BlockStore = null, // persistent block log (if --datadir)
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     name: []const u8,
 
@@ -193,6 +195,7 @@ fn ingest(node: *Node, bytes: []const u8, requests: *std.ArrayList(Hash256), to_
         node.gpa.free(owned);
         return;
     };
+    persist(node, owned);
     node.log("accepted block (chain now {d})", .{node.chain.dag.count()});
     to_flood.* = owned;
     cascade(node);
@@ -224,10 +227,27 @@ fn cascade(node: *Node) void {
             var rd = codec.Reader{ .buf = orph.bytes };
             const b = Block.decode(&rd, node.gpa) catch continue;
             _ = node.chain.acceptBlock(b) catch continue;
+            persist(node, orph.bytes);
             node.log("connected orphan (chain now {d})", .{node.chain.dag.count()});
             changed = true;
         }
     }
+}
+
+/// Append an accepted block to the on-disk log (no-op without --datadir).
+fn persist(node: *Node, bytes: []const u8) void {
+    if (node.store) |*s| s.append(bytes) catch {};
+}
+
+/// Replay callback: decode a stored block and accept it (startup, single-thread).
+fn replayAccept(node: *Node, bytes: []const u8) void {
+    const owned = node.gpa.dupe(u8, bytes) catch return;
+    var reader = codec.Reader{ .buf = owned };
+    const block = Block.decode(&reader, node.gpa) catch {
+        node.gpa.free(owned);
+        return;
+    };
+    _ = node.chain.acceptBlock(block) catch node.gpa.free(owned);
 }
 
 fn listen(node: *Node, port: u16) void {
@@ -260,14 +280,20 @@ fn mineLoop(node: *Node, target: usize) void {
             continue;
         };
         const accepted = if (node.chain.acceptBlock(block)) |_| true else |_| false;
-        const count = node.chain.dag.count();
-        node.lock.unlock();
         if (!accepted) {
+            node.lock.unlock();
             sleepMs(100);
             continue;
         }
+        const count = node.chain.dag.count();
+        const bytes = wire.encodeBlock(node.gpa, block) catch {
+            node.lock.unlock();
+            continue;
+        };
+        persist(node, bytes); // durably log the block before announcing it
+        node.lock.unlock();
+
         node.log("mined block {d}", .{count});
-        const bytes = wire.encodeBlock(node.gpa, block) catch continue;
         broadcastBlock(node, bytes, -1);
         node.gpa.free(bytes);
         sleepMs(500);
@@ -301,6 +327,7 @@ pub fn main(init: std.process.Init) !void {
     var target: usize = 6;
     var name: []const u8 = "node";
     var serve_secs: u64 = 0;
+    var datadir: ?[]const u8 = null;
     var peer_addrs: std.ArrayList(PeerAddr) = .empty;
     defer peer_addrs.deinit(gpa);
 
@@ -317,11 +344,25 @@ pub fn main(init: std.process.Init) !void {
             name = args.next() orelse "node";
         } else if (std.mem.eql(u8, arg, "--serve-secs")) {
             serve_secs = std.fmt.parseInt(u64, args.next() orelse "0", 10) catch 0;
+        } else if (std.mem.eql(u8, arg, "--datadir")) {
+            datadir = args.next();
         }
     }
 
     const node = try gpa.create(Node);
     node.* = .{ .gpa = gpa, .chain = chain.Chain.init(gpa, .{}), .name = name };
+
+    // Persistence: open the block log and replay it to rebuild the chain.
+    if (datadir) |dir| {
+        const path = try std.fmt.allocPrintSentinel(gpa, "{s}/blocks.log", .{dir}, 0);
+        var s = store_mod.BlockStore.open(path) catch {
+            node.log("could not open block store at {s}", .{path});
+            return;
+        };
+        const replayed = s.replay(gpa, node, replayAccept) catch 0;
+        if (replayed > 0) node.log("restored {d} blocks from disk (chain now {d})", .{ replayed, node.chain.dag.count() });
+        node.store = s;
+    }
 
     if (port > 0) _ = try std.Thread.spawn(.{}, listen, .{ node, port });
     sleepMs(300); // let listeners bind
