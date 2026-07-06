@@ -33,6 +33,7 @@ pub const Domain = enum {
     accumulator,
     utxo,
     license,
+    key_derivation,
 
     pub fn context(self: Domain) []const u8 {
         return switch (self) {
@@ -49,6 +50,7 @@ pub const Domain = enum {
             .accumulator => "zigchain.v1.accumulator",
             .utxo => "zigchain.v1.utxo",
             .license => "zigchain.v1.license",
+            .key_derivation => "zigchain.v1.kdf",
         };
     }
 };

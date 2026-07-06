@@ -56,6 +56,16 @@ docker build -t zigchain .
 docker run -d --restart unless-stopped -p 9000:9000 -v zigchain-data:/data -e ZIGCHAIN_MINE=true zigchain
 ```
 
+## Custody
+
+Air-gapped, post-quantum key custody with HD derivation and offline signing for
+every scheme (ML-DSA hot keys, SPHINCS+ cold vault). See [`spec/custody.md`](spec/custody.md).
+
+```
+zig build vault -- address --seed <hex32> --scheme ml_dsa_44 --path 44/0/0
+zig build vault -- sign    --seed <hex32> --scheme sphincs_128f --path 44/0/0 --sighash <hex32>
+```
+
 ## Licensing
 
 Commercial use is gated by a **post-quantum, offline-verifiable license** (ML-DSA

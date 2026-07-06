@@ -8,6 +8,8 @@
 pub const hash = @import("core/crypto/hash.zig");
 pub const pq = @import("core/crypto/pq/registry.zig");
 pub const sphincs = @import("core/crypto/pq/sphincs.zig");
+pub const kdf = @import("core/crypto/kdf.zig");
+pub const signer = @import("custody/signer.zig");
 pub const codec = @import("core/serialization/codec.zig");
 pub const primitives = @import("core/primitives/types.zig");
 pub const utxo = @import("core/ledger/utxo.zig");
@@ -37,6 +39,8 @@ test {
     _ = hash;
     _ = pq;
     _ = sphincs;
+    _ = kdf;
+    _ = signer;
     _ = codec;
     _ = primitives;
     _ = utxo;

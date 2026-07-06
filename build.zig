@@ -173,4 +173,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_license.addArgs(args);
     const license_step = b.step("license", "Issue/verify PQ software licenses");
     license_step.dependOn(&run_license.step);
+
+    // `zig build vault -- <address|sign|verify> ...` — the air-gapped custody tool.
+    const vault_mod = b.createModule(.{
+        .root_source_file = b.path("src/vault_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const vault_exe = b.addExecutable(.{ .name = "zigchain-vault", .root_module = vault_mod });
+    linkPqclean(vault_exe, pq);
+    b.installArtifact(vault_exe);
+    const run_vault = b.addRunArtifact(vault_exe);
+    if (b.args) |args| run_vault.addArgs(args);
+    const vault_step = b.step("vault", "Air-gapped custody: derive keys and sign offline");
+    vault_step.dependOn(&run_vault.step);
 }
