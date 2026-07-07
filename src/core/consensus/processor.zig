@@ -33,23 +33,29 @@ pub const Stats = struct {
     rejected: usize = 0,
 };
 
-/// Apply every block's transactions to `set` in the GHOSTDAG consensus order.
-/// A transaction that fails validation (e.g. its input was already spent by an
-/// earlier transaction in the order) is skipped and counted as rejected — it is
-/// not fatal, it is a losing double-spend.
-///
-/// Note: coinbase/subsidy handling is Phase-2; here the caller pre-seeds `set`
-/// with the coins to be spent (simulating already-mature outputs).
+/// Apply every block's transactions to `set` in the GHOSTDAG consensus order,
+/// from scratch. This is the recompute ORACLE that the incremental engine
+/// (ledger_state.zig) is checked against, so it enforces the identical rules:
+/// coinbases mint; a transaction is skipped (a losing double-spend) if its input
+/// was already spent OR if it spends a coinbase output that is not yet `maturity`
+/// blocks deep at the spending block's height (`heights`). `maturity == 0`
+/// disables the maturity check.
 pub fn applyOrder(
     gpa: std.mem.Allocator,
     set: *UtxoSet,
     gd: *Ghostdag,
     blocks: []const BlockTxs,
+    heights: *const std.AutoHashMapUnmanaged(Hash256, u64),
+    maturity: u64,
 ) !Stats {
     // Index block id -> transactions.
     var by_id: std.AutoHashMapUnmanaged(Hash256, []const Transaction) = .empty;
     defer by_id.deinit(gpa);
     for (blocks) |b| try by_id.put(gpa, b.id, b.txs);
+
+    // Coinbase outpoint -> creation height, for the maturity check.
+    var cb_height: std.AutoHashMapUnmanaged(prim.OutPoint, u64) = .empty;
+    defer cb_height.deinit(gpa);
 
     const order = try gd.order(gpa);
     defer gpa.free(order);
@@ -57,11 +63,12 @@ pub fn applyOrder(
     var stats: Stats = .{};
     for (order) |id| {
         const txs = by_id.get(id) orelse continue; // block carries no txs
+        const height = heights.get(id) orelse 0;
         for (txs) |tx| {
             if (tx.isCoinbase()) {
-                // Newly-minted supply. Its subsidy bound is checked by stateless
-                // block validation; here we just create its outputs.
                 try val.connectTx(set, tx, gpa);
+                const txid = try tx.txid(gpa);
+                for (tx.outputs, 0..) |_, i| try cb_height.put(gpa, .{ .txid = txid, .index = @intCast(i) }, height);
                 stats.applied += 1;
                 continue;
             }
@@ -69,6 +76,21 @@ pub fn applyOrder(
                 stats.rejected += 1;
                 continue;
             };
+            // Coinbase maturity.
+            var immature = false;
+            if (maturity != 0) for (tx.inputs) |in| {
+                if (cb_height.get(in.outpoint)) |cbh| {
+                    if (height < cbh +| maturity) {
+                        immature = true;
+                        break;
+                    }
+                }
+            };
+            if (immature) {
+                stats.rejected += 1;
+                continue;
+            }
+            for (tx.inputs) |in| _ = cb_height.remove(in.outpoint);
             try val.connectTx(set, tx, gpa);
             stats.applied += 1;
         }
@@ -161,7 +183,8 @@ test "cross-anticone double-spend resolves to a single deterministic winner" {
         .{ .id = h(4), .txs = &.{} },
     };
 
-    const stats = try applyOrder(gpa, &set, &gd, &blocks);
+    var nh: std.AutoHashMapUnmanaged(Hash256, u64) = .empty;
+    const stats = try applyOrder(gpa, &set, &gd, &blocks, &nh, 0);
 
     // Exactly one of the two conflicting txs is applied; the other is rejected.
     try testing.expectEqual(@as(usize, 1), stats.applied);
@@ -229,7 +252,8 @@ test "self-contained chain: coinbase mints, then the coin is spent" {
         .{ .id = h(1), .txs = &.{cb_a} },
         .{ .id = h(2), .txs = &.{ cb_b, alice_spend } },
     };
-    const stats = try applyOrder(gpa, &set, &gd, &blocks);
+    var nh: std.AutoHashMapUnmanaged(Hash256, u64) = .empty;
+    const stats = try applyOrder(gpa, &set, &gd, &blocks, &nh, 0);
 
     try testing.expectEqual(@as(usize, 3), stats.applied); // 2 coinbases + 1 spend
     try testing.expectEqual(@as(usize, 0), stats.rejected);

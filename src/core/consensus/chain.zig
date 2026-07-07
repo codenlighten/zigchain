@@ -59,6 +59,10 @@ pub const Config = struct {
     target_block_ms: u64 = 1000,
     daa_window: u32 = 10,
     ghostdag_k: u32 = 8,
+    /// A coinbase output cannot be spent until this many blocks (by DAG height)
+    /// after it was minted — reorg-safety against spending a coinbase whose block
+    /// is later orphaned. 0 disables (used by some unit tests).
+    coinbase_maturity: u64 = 100,
 };
 
 const validation = @import("../ledger/validation.zig");
@@ -203,7 +207,7 @@ pub const Chain = struct {
         try self.txmap.put(self.gpa, id, block.txs);
         const order = try self.gd.?.order(self.gpa);
         defer self.gpa.free(order);
-        try self.led.update(order, &self.txmap);
+        try self.led.update(order, &self.txmap, &self.heights, self.cfg.coinbase_maturity);
         return id;
     }
 
@@ -581,6 +585,57 @@ test "median-time-past: a block at or before the median is rejected" {
     try testing.expectError(Error.TimestampTooOld, chain.acceptBlock(stale));
     // ...and one strictly after the median is accepted (need not exceed the parent).
     _ = try chain.acceptBlock(try mineBlock(arena, &chain, &.{prev}, mtp + 1, &.{}, hashmod.zero));
+}
+
+test "coinbase maturity: an immature coinbase spend is skipped; a mature one applies" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const MlDsa44 = std.crypto.sign.mldsa.MLDSA44;
+
+    // maturity = 2: a coinbase minted at height 0 is spendable only at height >= 2.
+    var chain = Chain.init(arena, .{ .coinbase_maturity = 2 });
+    defer chain.deinit();
+
+    const alice = try MlDsa44.KeyPair.generateDeterministic([_]u8{0x0A} ** 32);
+    const alice_pk = try arena.dupe(u8, &alice.public_key.toBytes());
+    const alice_addr = prim.addressCommitment(.ml_dsa_44, alice_pk);
+    const bob_addr: Hash256 = [_]u8{0xBB} ** 32;
+
+    // Genesis coinbase pays Alice (subsidy at height 0).
+    const genesis = try mineBlock(arena, &chain, &.{}, 1000, &.{}, alice_addr);
+    _ = try chain.acceptBlock(genesis);
+    const gid = try genesis.header.id(arena);
+    const alice_coin = prim.OutPoint{ .txid = try genesis.txs[0].txid(arena), .index = 0 };
+
+    // Alice signs a spend of her coinbase coin to Bob.
+    var spend = prim.Transaction{
+        .version = 1,
+        .inputs = try arena.dupe(prim.Input, &.{.{ .outpoint = alice_coin }}),
+        .outputs = try arena.dupe(prim.Output, &.{.{ .value = 40, .scheme = .ml_dsa_44, .commitment = bob_addr }}),
+        .witnesses = &.{},
+    };
+    const sh = try spend.sighash(arena, .ml_dsa_44);
+    const ctx = [_]u8{1}; // ml_dsa_44 tag, bound as signature context
+    const sig = try arena.dupe(u8, &(try alice.signWithContext(&sh, null, &ctx)).toBytes());
+    spend.witnesses = try arena.dupe(prim.Witness, &.{.{ .scheme = .ml_dsa_44, .pubkey = alice_pk, .signature = sig }});
+    const bob_out = prim.OutPoint{ .txid = try spend.txid(arena), .index = 0 };
+
+    // Height 1 includes the spend — IMMATURE (1 < 0 + 2): the block is accepted
+    // but the spend does not apply.
+    _ = try chain.acceptBlock(try mineBlock(arena, &chain, &.{gid}, 2000, &.{spend}, hashmod.zero));
+    var s1 = try chain.utxoSet();
+    defer s1.deinit(arena);
+    try testing.expect(s1.contains(alice_coin)); // still unspent — rejected as immature
+    try testing.expect(!s1.contains(bob_out));
+
+    // Height 2 re-includes the same spend — MATURE (2 >= 0 + 2): now it applies.
+    const b1id = chain.tip().?; // selected tip is the height-1 block
+    _ = try chain.acceptBlock(try mineBlock(arena, &chain, &.{b1id}, 3000, &.{spend}, hashmod.zero));
+    var s2 = try chain.utxoSet();
+    defer s2.deinit(arena);
+    try testing.expect(!s2.contains(alice_coin)); // now spent
+    try testing.expect(s2.contains(bob_out)); // Bob received the output
 }
 
 test "chain commits to UTXO state; a coin proves statelessly against it" {

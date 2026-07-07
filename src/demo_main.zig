@@ -146,7 +146,8 @@ pub fn main() !void {
 
     // --- apply in consensus order ---
     var set: utxo.UtxoSet = .{};
-    const stats = try proc.applyOrder(gpa, &set, &gd, &blocks);
+    var no_heights: std.AutoHashMapUnmanaged(hashmod.Hash256, u64) = .empty;
+    const stats = try proc.applyOrder(gpa, &set, &gd, &blocks, &no_heights, 0);
     const order = try gd.order(gpa);
 
     std.debug.print("\nGHOSTDAG consensus order: ", .{});
