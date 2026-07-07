@@ -50,6 +50,27 @@ pub const Dag = struct {
         return self.nodes.get(id);
     }
 
+    /// All current tips (blocks that are no other block's parent), in canonical
+    /// ascending-id order. Caller owns the slice. A miner must reference EVERY
+    /// tip as parents so competing blocks merge into one DAG — the essence of a
+    /// BlockDAG. Mining only the single selected tip leaves parallel chains that
+    /// never reconcile and GHOSTDAG cannot converge them.
+    pub fn tips(self: Dag, gpa: std.mem.Allocator) Error![]Hash256 {
+        var is_parent: std.AutoHashMapUnmanaged(Hash256, void) = .empty;
+        defer is_parent.deinit(gpa);
+        var it = self.nodes.iterator();
+        while (it.next()) |e| for (e.value_ptr.*) |p| try is_parent.put(gpa, p, {});
+
+        var out: std.ArrayList(Hash256) = .empty;
+        errdefer out.deinit(gpa);
+        it = self.nodes.iterator();
+        while (it.next()) |e| {
+            if (!is_parent.contains(e.key_ptr.*)) try out.append(gpa, e.key_ptr.*);
+        }
+        std.mem.sort(Hash256, out.items, {}, hashLess);
+        return out.toOwnedSlice(gpa);
+    }
+
     /// Add a block. All parents must already be present (a DAG is built in
     /// dependency order), and the id must be new.
     pub fn addBlock(self: *Dag, id: Hash256, parents: []const Hash256) Error!void {
@@ -170,4 +191,41 @@ test "topological order: parents precede children, deterministic tie-break" {
     const order2 = try dag2.topoOrder(gpa);
     defer gpa.free(order2);
     try testing.expectEqualSlices(Hash256, order, order2);
+}
+
+test "tips: only childless blocks; a merge collapses parallel tips" {
+    const gpa = testing.allocator;
+    var dag = Dag.init(gpa);
+    defer dag.deinit();
+
+    const g = [_]u8{1} ** 32;
+    const a = [_]u8{2} ** 32;
+    const b = [_]u8{3} ** 32;
+    const m = [_]u8{4} ** 32;
+
+    try dag.addBlock(g, &.{});
+    {
+        const t = try dag.tips(gpa);
+        defer gpa.free(t);
+        try testing.expectEqual(@as(usize, 1), t.len);
+        try testing.expect(std.mem.eql(u8, &t[0], &g));
+    }
+
+    // Two siblings of g → two tips (g is now a parent).
+    try dag.addBlock(a, &.{g});
+    try dag.addBlock(b, &.{g});
+    {
+        const t = try dag.tips(gpa);
+        defer gpa.free(t);
+        try testing.expectEqual(@as(usize, 2), t.len);
+    }
+
+    // A block merging both siblings collapses them to a single tip.
+    try dag.addBlock(m, &.{ a, b });
+    {
+        const t = try dag.tips(gpa);
+        defer gpa.free(t);
+        try testing.expectEqual(@as(usize, 1), t.len);
+        try testing.expect(std.mem.eql(u8, &t[0], &m));
+    }
 }

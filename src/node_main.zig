@@ -51,12 +51,12 @@ fn sleepMs(ms: u64) void {
 const max_peers: usize = 128;
 const max_orphans: usize = 8192;
 const max_book: usize = 1024; // known-peer address book cap
-// Per-peer message rate: a 512-message burst, refilling ~500/s. An over-budget
-// message is DROPPED (not processed), which throttles a flood without aborting a
-// legitimate sync; only sustained flooding (many consecutive drops) disconnects.
+// Per-source-IP rate limit applied ONLY to the amplification-prone control
+// messages (getaddr/addr): a burst of `rate_burst`, refilling one per
+// `rate_refill_ms`. Over-budget control messages are ignored. Block flow
+// (inv/get_block/block) is never rate-limited — see handleConn.
 const rate_burst: u32 = 512;
 const rate_refill_ms: u32 = 2;
-const max_drop_strikes: u32 = 4096; // consecutive rate-limited drops before disconnect
 const discovery_interval_ms: u64 = 2000;
 const dial_cooldown_ms: u64 = 30_000; // minimum interval between dial attempts to one address
 const max_ip_buckets: usize = 65536; // cap on distinct source-IP rate-limit buckets
@@ -80,7 +80,6 @@ const Peer = struct {
     send: SpinLock = .{},
     /// The peer's advertised dial address, once its hello is seen (guarded by node.net_lock).
     listen_addr: ?NetAddr = null,
-    drop_strikes: u32 = 0, // consecutive rate-limited drops (handleConn thread only)
     /// Reference count: the peer list holds one; broadcastBlock takes one while
     /// sending. The fd is closed and the struct freed when it drops to zero, so a
     /// peer can be removed from the list without a use-after-free in a concurrent
@@ -122,6 +121,10 @@ const Node = struct {
     self_nonce: u64 = 0,
     book: addrbook.AddressBook = undefined,
     dialed: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    /// Packed addresses discovered to be OURSELVES (learned when a connection
+    /// echoes our own nonce). The loopback self-filter can't know our real
+    /// external IP, so we learn it here and never dial it again.
+    self_addrs: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     fn log(self: *Node, comptime fmt: []const u8, args: anytype) void {
         std.debug.print("[{s}] " ++ fmt ++ "\n", .{self.name} ++ args);
@@ -251,30 +254,33 @@ fn handleConn(node: *Node, peer: *Peer) void {
     while (!node.stop.load(.acquire)) {
         const r = wire.recvMessage(peer.fd, node.gpa) catch break;
         defer node.gpa.free(r.buffer);
-        // Rate-limit: an over-budget message is DROPPED (not processed), which
-        // throttles a flood without aborting a legitimate sync burst. Only a peer
-        // that sustains the flood past `max_drop_strikes` is disconnected.
-        if (!allowMessage(node, peer.ip)) {
-            peer.drop_strikes += 1;
-            if (peer.drop_strikes > max_drop_strikes) {
-                node.log("peer sustained flooding; disconnecting", .{});
-                break;
-            }
-            continue;
-        }
-        peer.drop_strikes = 0;
         switch (r.msg) {
             .hello => |h| {
-                if (h.nonce != 0 and h.nonce == node.self_nonce) break; // connected to ourselves
-                // Learn the peer's real dial address: its source IP + advertised port.
                 const a = NetAddr{ .ip = peer.ip, .port = h.listen_port };
+                if (h.nonce != 0 and h.nonce == node.self_nonce) {
+                    // Connected to ourselves — record our own external address so
+                    // discovery never dials it again, then drop the connection.
+                    node.net_lock.lock();
+                    _ = node.self_addrs.put(node.gpa, packAddr(a), {}) catch {};
+                    if (peer.listen_addr) |la| _ = node.self_addrs.put(node.gpa, packAddr(la), {}) catch {};
+                    node.net_lock.unlock();
+                    break;
+                }
+                // Learn the peer's real dial address: its source IP + advertised port.
                 node.net_lock.lock();
                 peer.listen_addr = a;
                 _ = node.book.add(a);
                 node.net_lock.unlock();
             },
-            .getaddr => sendAddrs(node, peer),
-            .addr => |bytes| {
+            // Rate-limit ONLY the amplification-prone control messages: getaddr
+            // (one request → up to 64 addresses) and addr (O(n) book work). An
+            // over-budget one is simply ignored, bounding the amplification.
+            // Block flow (inv/get_block/block) is NEVER rate-limited: it is
+            // self-limited by proof-of-work, and dropping a block mid-sync would
+            // stall an orphan cascade (a dropped block-response is never
+            // re-requested), which breaks synchronization entirely.
+            .getaddr => if (allowMessage(node, peer.ip)) sendAddrs(node, peer),
+            .addr => |bytes| if (allowMessage(node, peer.ip)) {
                 node.net_lock.lock();
                 var i: usize = 0;
                 while (i + 6 <= bytes.len) : (i += 6) _ = node.book.add(NetAddr.read6(bytes[i .. i + 6]));
@@ -345,8 +351,12 @@ fn ingest(node: *Node, bytes: []const u8, requests: *std.ArrayList(Hash256), to_
     var missing = false;
     for (block.header.parents) |p| {
         if (!node.chain.dag.contains(p)) {
-            missing = true;
-            requests.append(node.gpa, p) catch {};
+            missing = true; // this block can't be accepted yet
+            // Request the parent ONLY if we don't already hold it as an orphan.
+            // Re-requesting orphaned ancestors is what drowns a behind node in a
+            // request storm: with tip-merging every new block references many
+            // ancestors, so without this a catch-up never converges.
+            if (!node.orphans.contains(p)) requests.append(node.gpa, p) catch {};
         }
     }
     if (missing) {
@@ -361,6 +371,11 @@ fn ingest(node: *Node, bytes: []const u8, requests: *std.ArrayList(Hash256), to_
             return;
         };
         node.orphans.put(node.gpa, id, .{ .bytes = owned, .parents = parents_copy }) catch {};
+        // Try to drain the orphan pool: a behind node under tip-merging receives
+        // every new block as an orphan, so if the cascade only ran on a direct
+        // accept it would never fire and the (complete) orphan DAG would pile up
+        // forever. Running it here connects any orphan whose ancestry is present.
+        cascade(node);
         return;
     }
 
@@ -448,6 +463,7 @@ fn discover(node: *Node) void {
         if (node.peers.items.len < max_peers) {
             for (node.book.items()) |a| {
                 if (nt >= targets.len) break;
+                if (node.self_addrs.contains(packAddr(a))) continue; // that's us
                 if (connectedToLocked(node, a)) continue; // already connected — no duplicate link
                 if (node.dialed.get(packAddr(a))) |last| {
                     if (now - last < dial_cooldown_ms) continue; // dialed recently; back off
@@ -474,8 +490,12 @@ fn statusLoop(node: *Node) void {
         node.lock.lock();
         const tip = node.chain.tip();
         // The selected tip's height, and a checkpoint block at a rounded-down
-        // absolute height that peers on the same chain all agree on.
+        // absolute height that peers on the same chain all agree on. `count` is
+        // the total DAG block count — when count > height the DAG genuinely
+        // forked (off-selected-chain sibling blocks exist), so agreement on the
+        // stable checkpoint proves GHOSTDAG resolved the forks identically.
         const tip_h: u64 = if (tip) |t| (node.chain.height(t) orelse 0) else 0;
+        const count: usize = node.chain.dag.count();
         const ckpt: u64 = (tip_h / status_ckpt_interval) * status_ckpt_interval;
         const stable = node.chain.selectedBlockAtHeight(ckpt);
         node.lock.unlock();
@@ -483,15 +503,16 @@ fn statusLoop(node: *Node) void {
         const npeers = node.peers.items.len;
         node.net_lock.unlock();
         if (tip) |t| {
-            node.log("STATUS height={d} ckpt={d} peers={d} tip={s} stable={s}", .{
+            node.log("STATUS height={d} count={d} ckpt={d} peers={d} tip={s} stable={s}", .{
                 tip_h,
+                count,
                 ckpt,
                 npeers,
                 std.fmt.bytesToHex(t, .lower)[0..12],
                 std.fmt.bytesToHex(stable orelse hashmod.zero, .lower)[0..12],
             });
         } else {
-            node.log("STATUS height=0 ckpt=0 peers={d} tip=none stable=none", .{npeers});
+            node.log("STATUS height=0 count=0 ckpt=0 peers={d} tip=none stable=none", .{npeers});
         }
     }
 }
@@ -501,11 +522,15 @@ fn mineLoop(node: *Node, target: usize) void {
     // target == 0 means "run forever" (daemon mode).
     while (!node.stop.load(.acquire) and (target == 0 or node.blockCount() < target)) {
         node.lock.lock();
-        var pbuf: [1]Hash256 = undefined;
-        const parents: []const Hash256 = if (node.chain.tip()) |t| p: {
-            pbuf[0] = t;
-            break :p pbuf[0..1];
-        } else &.{};
+        // Mine on ALL current DAG tips (not just the selected tip) so competing
+        // blocks from other miners are merged into one DAG — this is what lets
+        // GHOSTDAG converge two miners onto one chain. Empty for genesis.
+        const parents = node.chain.dag.tips(node.gpa) catch {
+            node.lock.unlock();
+            sleepMs(100);
+            continue;
+        };
+        defer node.gpa.free(parents);
         seq += 1;
         // Wall-clock timestamp (unix ms, the DAA's unit), bumped past
         // median-time-past so the block is always accepted even when mining
