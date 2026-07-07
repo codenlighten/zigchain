@@ -68,8 +68,15 @@ pub const Error = error{
     UnknownParent,
     InvalidPow,
     WrongDifficulty,
+    TimestampTooOld, // fails median-time-past
 } || block_validation.Error || dag_mod.Error || ghostdag.Error ||
     validation.Error || utxo.Error || std.mem.Allocator.Error;
+
+/// Number of most-recent selected-chain blocks the median-time-past is taken
+/// over. A block's timestamp must be strictly greater than this median, which
+/// bounds how far a miner can move time backward and limits time-warp attacks on
+/// the difficulty adjustment.
+const mtp_window: u32 = 11;
 
 pub const Chain = struct {
     gpa: std.mem.Allocator,
@@ -108,6 +115,24 @@ pub const Chain = struct {
             }
         }
         return sp;
+    }
+
+    /// Median timestamp of the last `mtp_window` blocks on the selected chain
+    /// ending at these parents' selected parent. A block's timestamp must exceed
+    /// this. Returns 0 for a parentless (genesis) block.
+    pub fn medianTimePast(self: *const Chain, parents: []const Hash256) u64 {
+        if (parents.len == 0) return 0;
+        var times: [mtp_window]u64 = undefined;
+        var n: usize = 0;
+        var cur = self.selectedParentOf(parents);
+        while (n < mtp_window) {
+            times[n] = self.blocks.get(cur).?.header.timestamp;
+            n += 1;
+            const d = (self.gd orelse break).get(cur) orelse break;
+            cur = d.selected_parent orelse break; // reached genesis
+        }
+        std.mem.sort(u64, times[0..n], {}, std.sort.asc(u64));
+        return times[n / 2];
     }
 
     /// DAG height of a block with these parents = selected-parent height + 1.
@@ -150,6 +175,14 @@ pub const Chain = struct {
 
         // 2. Difficulty matches the DAA expectation.
         if (block.header.bits != self.expectedBits(block.header.parents)) return Error.WrongDifficulty;
+
+        // 2b. Timestamp must be strictly after the median of recent history
+        // (median-time-past) — the deterministic half of timestamp validation.
+        // (The future-time bound is a wall-clock acceptance policy applied at the
+        // node edge, not a consensus rule.)
+        if (block.header.parents.len > 0 and block.header.timestamp <= self.medianTimePast(block.header.parents)) {
+            return Error.TimestampTooOld;
+        }
 
         // 3. Context-free validation at the computed height.
         const block_height = self.heightOf(block.header.parents);
@@ -257,6 +290,11 @@ const testing = std.testing;
 /// coinbase carrying the right height, and a valid nonce. Public so nodes,
 /// tests, and demos can construct valid blocks. Block memory is drawn from
 /// `arena` and must outlive its use by the chain.
+///
+/// `timestamp` is a wall-clock time (unix milliseconds — the unit the DAA's
+/// `target_block_ms` is in). `extranonce` only needs to be unique per block so
+/// that sibling coinbases at the same height keep distinct txids; it is kept
+/// SEPARATE from the timestamp so the timestamp can be a real clock value.
 pub fn mineBlock(
     arena: std.mem.Allocator,
     chain: *Chain,
@@ -265,12 +303,26 @@ pub fn mineBlock(
     extra_txs: []const prim.Transaction,
     cb_commitment: Hash256,
 ) !Block {
+    // Convenience: reuse the timestamp as the extranonce (fine for tests/demos,
+    // whose timestamps are already distinct per block).
+    return mineBlockExtra(arena, chain, parents, timestamp, timestamp, extra_txs, cb_commitment);
+}
+
+pub fn mineBlockExtra(
+    arena: std.mem.Allocator,
+    chain: *Chain,
+    parents: []const Hash256,
+    timestamp: u64,
+    extranonce: u64,
+    extra_txs: []const prim.Transaction,
+    cb_commitment: Hash256,
+) !Block {
     const height = chain.heightOf(parents);
-    // payload = height (committed) ++ timestamp as extranonce, so sibling
-    // coinbases at the same height still get distinct txids.
+    // payload = height (committed) ++ a unique extranonce, so sibling coinbases
+    // at the same height still get distinct txids.
     const payload = arena.alloc(u8, 16) catch unreachable;
     std.mem.writeInt(u64, payload[0..8], height, .little);
-    std.mem.writeInt(u64, payload[8..16], timestamp, .little);
+    std.mem.writeInt(u64, payload[8..16], extranonce, .little);
 
     const cb = prim.Transaction{
         .version = 1,
@@ -504,6 +556,31 @@ test "difficulty adjusts: fast blocks raise difficulty past the window" {
     // With the window now full of fast blocks, the DAA demands harder difficulty.
     const now_bits = chain.expectedBits(&.{prev});
     try testing.expect(pow.compactToTarget(now_bits) < pow.compactToTarget(genesis_bits));
+}
+
+test "median-time-past: a block at or before the median is rejected" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var chain = Chain.init(arena, .{});
+    defer chain.deinit();
+
+    // Genesis + a few blocks with strictly increasing timestamps.
+    var prev = try chain.acceptBlock(try mineBlock(arena, &chain, &.{}, 1000, &.{}, hashmod.zero));
+    var t: u64 = 1000;
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        t += 1000;
+        prev = try chain.acceptBlock(try mineBlock(arena, &chain, &.{prev}, t, &.{}, hashmod.zero));
+    }
+
+    const mtp = chain.medianTimePast(&.{prev});
+    // A block timestamped exactly at the median is rejected...
+    const stale = try mineBlock(arena, &chain, &.{prev}, mtp, &.{}, hashmod.zero);
+    try testing.expectError(Error.TimestampTooOld, chain.acceptBlock(stale));
+    // ...and one strictly after the median is accepted (need not exceed the parent).
+    _ = try chain.acceptBlock(try mineBlock(arena, &chain, &.{prev}, mtp + 1, &.{}, hashmod.zero));
 }
 
 test "chain commits to UTXO state; a coin proves statelessly against it" {

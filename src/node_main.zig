@@ -61,6 +61,7 @@ const discovery_interval_ms: u64 = 2000;
 const dial_cooldown_ms: u64 = 30_000; // minimum interval between dial attempts to one address
 const max_ip_buckets: usize = 65536; // cap on distinct source-IP rate-limit buckets
 const status_ckpt_interval: u64 = 50; // STATUS reports the selected block at this height granularity
+const max_future_drift_ms: u64 = 2 * 60 * 60 * 1000; // reject blocks timestamped >2h ahead of our clock
 
 const NetAddr = wire.NetAddr;
 
@@ -329,6 +330,13 @@ fn ingest(node: *Node, bytes: []const u8, requests: *std.ArrayList(Hash256), to_
         node.gpa.free(owned);
         return;
     };
+    // Future-time acceptance policy (wall-clock, node-local — NOT a consensus
+    // rule): drop a block timestamped too far ahead of our clock. If it is
+    // legitimate we re-learn it once time catches up, so this can't fork us.
+    if (block.header.timestamp > realtimeMs() + max_future_drift_ms) {
+        node.gpa.free(owned);
+        return;
+    }
     if (node.chain.dag.contains(id) or node.orphans.contains(id)) {
         node.gpa.free(owned);
         return;
@@ -499,8 +507,12 @@ fn mineLoop(node: *Node, target: usize) void {
             break :p pbuf[0..1];
         } else &.{};
         seq += 1;
-        const ts = nowNs() + seq; // unique per block (coinbase extranonce)
-        const block = chain.mineBlock(node.gpa, &node.chain, parents, ts, &.{}, hashmod.zero) catch {
+        // Wall-clock timestamp (unix ms, the DAA's unit), bumped past
+        // median-time-past so the block is always accepted even when mining
+        // faster than clock resolution. A separate unique extranonce keeps
+        // sibling coinbases distinct.
+        const ts = @max(realtimeMs(), node.chain.medianTimePast(parents) + 1);
+        const block = chain.mineBlockExtra(node.gpa, &node.chain, parents, ts, seq, &.{}, hashmod.zero) catch {
             node.lock.unlock();
             sleepMs(100);
             continue;
@@ -541,6 +553,12 @@ fn parsePeer(s: []const u8) ?PeerAddr {
     }
     if (i != 4) return null;
     return .{ .ip = ip, .port = port };
+}
+
+fn realtimeMs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
 }
 
 fn realtimeSeconds() u64 {
