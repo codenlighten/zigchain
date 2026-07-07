@@ -194,9 +194,21 @@ pub const Chain = struct {
         }
         if (steps < self.cfg.daa_window) return sp_hdr.bits; // not enough history yet
 
+        // DAG-aware retarget: difficulty must track TOTAL block production, not
+        // just the selected chain. Over this window the selected chain advanced
+        // `daa_window` steps, but the DAG actually produced `blue_score`-delta
+        // blue blocks (the parallel mergeset blocks included) — that count is the
+        // true measure of hashrate. Retargeting on selected-chain steps alone
+        // would under-count a widening DAG, hold difficulty too low, and let the
+        // DAG widen without bound. Using the blue-score delta raises difficulty in
+        // proportion to how many blocks the network is really finding.
+        const sp_score = self.gd.?.get(sp).?.blue_score;
+        const start_score = self.gd.?.get(cur).?.blue_score;
+        const blocks_in_window = sp_score - start_score; // >= daa_window >= 1
+
         const oldest_ts = self.blocks.get(cur).?.header.timestamp;
         const actual = sp_hdr.timestamp -| oldest_ts;
-        const expected = self.cfg.target_block_ms * self.cfg.daa_window;
+        const expected = self.cfg.target_block_ms *| blocks_in_window;
         return pow.retarget(sp_hdr.bits, actual, expected);
     }
 
@@ -767,6 +779,50 @@ test "multi-node: concurrent mining forks then converges on all nodes" {
     var set = try nodes[0].utxoSet();
     defer set.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 4), set.count());
+}
+
+test "DAG-aware DAA: a wide DAG raises difficulty above a same-cadence narrow chain" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cfg = Config{ .daa_window = 4 }; // target_block_ms = 1000, genesis = easy
+
+    // Narrow chain: exactly one block per 1000ms selected step. Block production
+    // matches the target rate, so difficulty must stay put at the genesis floor.
+    var narrow = Chain.init(testing.allocator, cfg);
+    defer narrow.deinit();
+    var pid = try narrow.acceptBlock(try mineBlock(arena, &narrow, &.{}, 1000, &.{}, hashmod.zero));
+    var ts: u64 = 2000;
+    var i: u32 = 0;
+    while (i < 6) : (i += 1) {
+        pid = try narrow.acceptBlock(try mineBlock(arena, &narrow, &.{pid}, ts, &.{}, hashmod.zero));
+        ts += 1000;
+    }
+    const narrow_bits = narrow.expectedBits(&.{pid});
+    try testing.expectEqual(cfg.genesis_bits, narrow_bits); // on-target → unchanged
+
+    // Wide DAG: the SAME 1000ms cadence on the selected chain, but each step also
+    // mints a parallel sibling that the next block merges — so the network really
+    // finds ~2 blocks per interval. A DAG-aware DAA must see that (via blue score)
+    // and raise difficulty; a selected-chain-only DAA would miss it entirely.
+    var wide = Chain.init(testing.allocator, cfg);
+    defer wide.deinit();
+    var main = try wide.acceptBlock(try mineBlock(arena, &wide, &.{}, 1000, &.{}, hashmod.zero));
+    ts = 2000;
+    i = 0;
+    while (i < 6) : (i += 1) {
+        // Sibling lands mid-interval; the selected tip (main) lands at the step
+        // boundary, so the selected chain keeps its strict 1000ms cadence.
+        const sib = try wide.acceptBlock(try mineBlockExtra(arena, &wide, &.{main}, ts - 500, 900_000 + i, &.{}, hashmod.zero));
+        main = try wide.acceptBlock(try mineBlock(arena, &wide, &.{ main, sib }, ts, &.{}, hashmod.zero));
+        ts += 1000;
+    }
+    const wide_bits = wide.expectedBits(&.{main});
+
+    // Same wall-clock cadence, more blocks found → the wide DAG's target is
+    // strictly lower (difficulty strictly higher). This is the whole point of a
+    // DAG-aware retarget.
+    try testing.expect(pow.compactToTarget(wide_bits) < pow.compactToTarget(narrow_bits));
 }
 
 test "emission: subsidy halves per interval then holds at the perpetual tail" {
