@@ -54,7 +54,14 @@ fn lessCoin(_: void, a: Coin, b: Coin) bool {
 
 pub const Config = struct {
     genesis_bits: u32 = pow.easy_bits,
-    subsidy: u64 = 50,
+    // Monetary policy (genesis parameters), all in base units. Emission halves
+    // every `halving_interval` blocks and decays toward a perpetual
+    // `tail_subsidy` floor, so the security budget never hits a hard cliff. For
+    // mainnet these are scaled by the coin's base-unit granularity (e.g. 1 coin
+    // = 1e8 base units); the small defaults keep unit tests readable.
+    initial_subsidy: u64 = 50,
+    halving_interval: u64 = 210_000,
+    tail_subsidy: u64 = 1,
     max_block_mass: u64 = 1_000_000,
     target_block_ms: u64 = 1000,
     daa_window: u32 = 10,
@@ -145,6 +152,18 @@ pub const Chain = struct {
         return self.heights.get(self.selectedParentOf(parents)).? + 1;
     }
 
+    /// Block subsidy at `height` under the halving-to-tail emission schedule:
+    /// `initial_subsidy` halved once per `halving_interval` blocks, floored at
+    /// the perpetual `tail_subsidy`. Deterministic and overflow-safe (a shift of
+    /// >= 63 collapses to the tail rather than invoking UB). This is the sole
+    /// source of new supply, so every mint site must derive its value here.
+    pub fn subsidyAt(self: *const Chain, block_height: u64) u64 {
+        const halvings = block_height / self.cfg.halving_interval;
+        if (halvings >= 63) return self.cfg.tail_subsidy;
+        const decayed = self.cfg.initial_subsidy >> @intCast(halvings);
+        return @max(decayed, self.cfg.tail_subsidy);
+    }
+
     /// The difficulty a block with these parents must use, per the DAA.
     pub fn expectedBits(self: *const Chain, parents: []const Hash256) u32 {
         if (parents.len == 0) return self.cfg.genesis_bits;
@@ -191,7 +210,7 @@ pub const Chain = struct {
         // 3. Context-free validation at the computed height.
         const block_height = self.heightOf(block.header.parents);
         try block_validation.validateStateless(self.gpa, block, .{
-            .subsidy = self.cfg.subsidy,
+            .subsidy = self.subsidyAt(block_height),
             .max_block_mass = self.cfg.max_block_mass,
             .height = block_height,
         });
@@ -331,7 +350,7 @@ pub fn mineBlockExtra(
     const cb = prim.Transaction{
         .version = 1,
         .inputs = &.{},
-        .outputs = arena.dupe(prim.Output, &.{.{ .value = chain.cfg.subsidy, .scheme = .ml_dsa_44, .commitment = cb_commitment }}) catch unreachable,
+        .outputs = arena.dupe(prim.Output, &.{.{ .value = chain.subsidyAt(height), .scheme = .ml_dsa_44, .commitment = cb_commitment }}) catch unreachable,
         .witnesses = &.{},
         .payload = payload,
     };
@@ -733,4 +752,34 @@ test "multi-node: concurrent mining forks then converges on all nodes" {
     var set = try nodes[0].utxoSet();
     defer set.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 4), set.count());
+}
+
+test "emission: subsidy halves per interval then holds at the perpetual tail" {
+    var chain = Chain.init(testing.allocator, .{
+        .initial_subsidy = 64,
+        .halving_interval = 10,
+        .tail_subsidy = 2,
+    });
+    defer chain.deinit();
+
+    // Full subsidy across the first interval [0, halving_interval).
+    try testing.expectEqual(@as(u64, 64), chain.subsidyAt(0));
+    try testing.expectEqual(@as(u64, 64), chain.subsidyAt(9));
+    // Each subsequent interval halves it: 64 -> 32 -> 16 -> 8 -> 4.
+    try testing.expectEqual(@as(u64, 32), chain.subsidyAt(10));
+    try testing.expectEqual(@as(u64, 16), chain.subsidyAt(20));
+    try testing.expectEqual(@as(u64, 4), chain.subsidyAt(40));
+    // 64 >> 5 == 2, still == tail; then it floors at the tail forever after.
+    try testing.expectEqual(@as(u64, 2), chain.subsidyAt(50));
+    try testing.expectEqual(@as(u64, 2), chain.subsidyAt(60)); // 64>>6==1 -> floored to 2
+    try testing.expectEqual(@as(u64, 2), chain.subsidyAt(1_000_000)); // far past: still the tail
+    // A shift wider than the integer must collapse to the tail, not wrap/UB.
+    try testing.expectEqual(@as(u64, 2), chain.subsidyAt(std.math.maxInt(u64)));
+
+    // The default mainnet-style schedule mints the full initial subsidy at genesis.
+    var dflt = Chain.init(testing.allocator, .{});
+    defer dflt.deinit();
+    try testing.expectEqual(dflt.cfg.initial_subsidy, dflt.subsidyAt(0));
+    try testing.expectEqual(dflt.cfg.initial_subsidy, dflt.subsidyAt(dflt.cfg.halving_interval - 1));
+    try testing.expectEqual(dflt.cfg.initial_subsidy / 2, dflt.subsidyAt(dflt.cfg.halving_interval));
 }
