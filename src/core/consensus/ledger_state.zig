@@ -26,6 +26,10 @@ const prim = @import("../primitives/types.zig");
 const utxo = @import("../ledger/utxo.zig");
 const validation = @import("../ledger/validation.zig");
 const hashmod = @import("../crypto/hash.zig");
+const massmod = @import("mass.zig");
+const fees = @import("fees.zig");
+
+pub const Policy = fees.Policy;
 
 const Hash256 = hashmod.Hash256;
 const OutPoint = prim.OutPoint;
@@ -80,14 +84,14 @@ pub const IncrementalUtxo = struct {
 
     /// Bring the applied state in line with `order` (a consensus ordering of
     /// blocks), looking transactions up in `blocks` and each block's height in
-    /// `heights`. A coinbase output cannot be spent until `maturity` blocks after
-    /// its creation (0 disables the check).
+    /// `heights`. `policy` carries the coinbase-maturity depth and the EIP-1559
+    /// fee rules (base burn + producer tip).
     pub fn update(
         self: *IncrementalUtxo,
         order: []const Hash256,
         blocks: *const BlockTxMap,
         heights: *const std.AutoHashMapUnmanaged(Hash256, u64),
-        maturity: u64,
+        policy: Policy,
     ) !void {
         // Longest common prefix of the currently-applied order and the new one.
         var d: usize = 0;
@@ -112,7 +116,7 @@ pub const IncrementalUtxo = struct {
         for (order[d..]) |id| {
             const txs = if (blocks.get(id)) |t| t else &.{};
             const height = heights.get(id) orelse 0;
-            const bu = try self.applyBlock(txs, height, maturity);
+            const bu = try self.applyBlock(txs, height, policy);
             try self.applied.append(self.gpa, id);
             try self.undo.append(self.gpa, bu);
         }
@@ -120,16 +124,32 @@ pub const IncrementalUtxo = struct {
 
     /// Apply one block's transactions (same rules as processor.applyOrder:
     /// coinbases mint; other txs apply if valid AND their coinbase inputs are
-    /// mature, else are dropped), returning the undo data.
-    fn applyBlock(self: *IncrementalUtxo, txs: []const Transaction, height: u64, maturity: u64) !BlockUndo {
+    /// mature, else are dropped), returning the undo data. Under `collect_tips`
+    /// the per-tx fee is split into a burned base and a producer tip; the block's
+    /// aggregate tip is minted to the coinbase beneficiary as one extra output.
+    fn applyBlock(self: *IncrementalUtxo, txs: []const Transaction, height: u64, policy: Policy) !BlockUndo {
         var removed: std.ArrayList(OutPoint) = .empty;
         errdefer removed.deinit(self.gpa);
         var restored: std.ArrayList(Coin) = .empty;
         errdefer restored.deinit(self.gpa);
 
+        // The block's producer (from its coinbase) and the tips it earns. The tip
+        // is minted by the protocol here — never claimed by the miner's coinbase —
+        // so it cannot over-claim, and a reorg reverses it via the undo record
+        // exactly like the coinbase itself.
+        var beneficiary: ?Output = null;
+        var cb_txid: Hash256 = undefined;
+        var cb_out_count: usize = 0;
+        var tip_total: u64 = 0;
+
         for (txs) |tx| {
             if (tx.isCoinbase()) {
                 const txid = try tx.txid(self.gpa);
+                if (beneficiary == null and tx.outputs.len > 0) {
+                    beneficiary = tx.outputs[0];
+                    cb_txid = txid;
+                    cb_out_count = tx.outputs.len;
+                }
                 for (tx.outputs, 0..) |o, i| {
                     const op = OutPoint{ .txid = txid, .index = @intCast(i) };
                     try self.set.add(self.gpa, op, o);
@@ -137,9 +157,9 @@ pub const IncrementalUtxo = struct {
                     try removed.append(self.gpa, op);
                 }
             } else {
-                _ = validation.validateTx(&self.set, tx, self.gpa) catch continue; // losing double-spend
+                const fee = validation.validateTx(&self.set, tx, self.gpa) catch continue; // losing double-spend
                 // Coinbase maturity: every coinbase input must be `maturity` deep.
-                if (self.immatureSpend(tx, height, maturity)) continue;
+                if (self.immatureSpend(tx, height, policy.maturity)) continue;
                 const txid = try tx.txid(self.gpa);
                 for (tx.inputs) |in| {
                     const coin = self.set.get(in.outpoint).?;
@@ -152,6 +172,23 @@ pub const IncrementalUtxo = struct {
                     try self.set.add(self.gpa, op, o);
                     try removed.append(self.gpa, op);
                 }
+                if (policy.collect_tips) {
+                    const m = massmod.txMass(self.gpa, tx) catch 0;
+                    tip_total +|= fees.split(fee, m, policy.base_fee_rate).tip;
+                }
+            }
+        }
+
+        // Mint the block's aggregate tip to the producer, maturity-locked like a
+        // coinbase. The outpoint is the coinbase txid at the first index past its
+        // real outputs — deterministic and collision-free — so both apply paths
+        // agree byte-for-byte.
+        if (policy.collect_tips and tip_total > 0) {
+            if (beneficiary) |b| {
+                const op = OutPoint{ .txid = cb_txid, .index = @intCast(cb_out_count) };
+                try self.set.add(self.gpa, op, .{ .value = tip_total, .scheme = b.scheme, .commitment = b.commitment });
+                try self.cb_height.put(self.gpa, op, height);
+                try removed.append(self.gpa, op);
             }
         }
         return .{
@@ -251,7 +288,7 @@ test "property: incremental UTXO equals recompute across random DAG growth" {
             try gd.addBlock(idOf(@intCast(i)));
             const order = try gd.order(gpa);
             defer gpa.free(order);
-            try inc.update(order, &blocks, &heights, 100);
+            try inc.update(order, &blocks, &heights, .{ .maturity = 100 });
         }
 
         // Recompute from scratch and compare.
@@ -261,7 +298,7 @@ test "property: incremental UTXO equals recompute across random DAG growth" {
         while (bit.next()) |e| try items.append(gpa, .{ .id = e.key_ptr.*, .txs = e.value_ptr.* });
         var rec: UtxoSet = .{};
         defer rec.deinit(gpa);
-        _ = try processor.applyOrder(gpa, &rec, &gd, items.items, &heights, 100);
+        _ = try processor.applyOrder(gpa, &rec, &gd, items.items, &heights, .{ .maturity = 100 });
 
         try testing.expect(sameSet(&inc.set, &rec));
     }
@@ -328,18 +365,100 @@ test "reorg flips a double-spend winner; state matches recompute" {
     defer heights.deinit(gpa);
 
     // Order 1: B1 before B2 → Bob wins, Carol's tx is a losing double-spend.
-    try inc.update(&.{ G, B1, B2 }, &blocks, &heights, 0);
+    try inc.update(&.{ G, B1, B2 }, &blocks, &heights, .{});
     try testing.expect(inc.set.contains(.{ .txid = toBob_id, .index = 0 }));
     try testing.expect(!inc.set.contains(.{ .txid = toCarol_id, .index = 0 }));
 
     // A reorg swaps the order: B2 before B1 → Carol wins, Bob's tx now loses.
-    try inc.update(&.{ G, B2, B1 }, &blocks, &heights, 0);
+    try inc.update(&.{ G, B2, B1 }, &blocks, &heights, .{});
     try testing.expect(inc.set.contains(.{ .txid = toCarol_id, .index = 0 }));
     try testing.expect(!inc.set.contains(.{ .txid = toBob_id, .index = 0 }));
 
     // The incrementally-reorged state matches a from-scratch recompute of order 2.
     var rec = IncrementalUtxo.init(gpa);
     defer rec.deinit();
-    try rec.update(&.{ G, B2, B1 }, &blocks, &heights, 0);
+    try rec.update(&.{ G, B2, B1 }, &blocks, &heights, .{});
     try testing.expect(sameSet(&inc.set, &rec.set));
+}
+
+test "fee split: producer earns the tip, base is burned, reverses on reorg, matches recompute" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const alice = Key.init(1);
+    const bob = Key.init(2);
+    const miner = Key.init(9);
+
+    // Block G: coinbase mints 1_000_000 to Alice.
+    const h0 = [_]u8{0} ** 8;
+    const cbG = Transaction{ .version = 1, .inputs = &.{}, .outputs = try arena.dupe(prim.Output, &.{.{ .value = 1_000_000, .scheme = .ml_dsa_44, .commitment = alice.commitment() }}), .witnesses = &.{}, .payload = &h0 };
+    const cbG_id = try cbG.txid(arena);
+    const alice_coin = OutPoint{ .txid = cbG_id, .index = 0 };
+
+    // Block B: coinbase to the MINER + Alice pays Bob 900k, leaving a 100k fee.
+    const h1 = [_]u8{1} ++ [_]u8{0} ** 7;
+    const cbB = Transaction{ .version = 1, .inputs = &.{}, .outputs = try arena.dupe(prim.Output, &.{.{ .value = 50, .scheme = .ml_dsa_44, .commitment = miner.commitment() }}), .witnesses = &.{}, .payload = &h1 };
+    const cbB_id = try cbB.txid(arena);
+
+    var spend = Transaction{ .version = 1, .inputs = try arena.dupe(prim.Input, &.{.{ .outpoint = alice_coin }}), .outputs = try arena.dupe(prim.Output, &.{.{ .value = 900_000, .scheme = .ml_dsa_44, .commitment = bob.commitment() }}), .witnesses = &.{} };
+    const ss = alice.sign(try spend.sighash(arena, .ml_dsa_44));
+    spend.witnesses = try arena.dupe(prim.Witness, &.{.{ .scheme = .ml_dsa_44, .pubkey = &alice.pk, .signature = &ss }});
+    const fee: u64 = 100_000;
+    const spend_id = try spend.txid(arena);
+
+    const G = idOf(200);
+    const B = idOf(201);
+    var blocks: BlockTxMap = .empty;
+    defer blocks.deinit(gpa);
+    try blocks.put(gpa, G, try arena.dupe(Transaction, &.{cbG}));
+    try blocks.put(gpa, B, try arena.dupe(Transaction, &.{ cbB, spend }));
+    var heights: std.AutoHashMapUnmanaged(Hash256, u64) = .empty;
+    defer heights.deinit(gpa);
+    try heights.put(gpa, G, 0);
+    try heights.put(gpa, B, 1);
+
+    // A non-zero base rate so BOTH halves are exercised: base burned, tip paid.
+    const policy = Policy{ .maturity = 0, .base_fee_rate = 1, .collect_tips = true };
+    const mass_units = try massmod.txMass(gpa, spend);
+    const expected = fees.split(fee, mass_units, policy.base_fee_rate);
+    try testing.expect(expected.base > 0 and expected.tip > 0);
+
+    var inc = IncrementalUtxo.init(gpa);
+    defer inc.deinit();
+    try inc.update(&.{ G, B }, &blocks, &heights, policy);
+
+    // The tip is minted to the miner at the coinbase txid, one index past its
+    // real outputs (cbB has a single output at index 0, so the tip is at index 1).
+    const tip_op = OutPoint{ .txid = cbB_id, .index = 1 };
+    const tip_coin = inc.set.get(tip_op) orelse return error.NoTip;
+    try testing.expectEqual(expected.tip, tip_coin.value);
+    const mc = miner.commitment();
+    try testing.expectEqualSlices(u8, &mc, &tip_coin.commitment);
+    // Bob got paid; Alice's coin is spent; the base fee (fee - tip) was burned.
+    try testing.expect(inc.set.contains(.{ .txid = spend_id, .index = 0 }));
+    try testing.expect(!inc.set.contains(alice_coin));
+    try testing.expectEqual(fee - expected.tip, expected.base);
+
+    // Differential guard: a from-scratch recompute yields the identical set, so
+    // the incremental and oracle tip logic agree byte-for-byte.
+    var dag = Dag.init(gpa);
+    defer dag.deinit();
+    try dag.addBlock(G, &.{});
+    try dag.addBlock(B, &.{G});
+    var gd = Ghostdag.init(gpa, &dag, 1);
+    defer gd.deinit();
+    try gd.compute();
+    const items = [_]processor.BlockTxs{ .{ .id = G, .txs = blocks.get(G).? }, .{ .id = B, .txs = blocks.get(B).? } };
+    var rec: UtxoSet = .{};
+    defer rec.deinit(gpa);
+    _ = try processor.applyOrder(gpa, &rec, &gd, &items, &heights, policy);
+    try testing.expect(sameSet(&inc.set, &rec));
+
+    // Reorg away block B: the protocol-minted tip is reversed with it (it rides
+    // the same undo path as the coinbase), and Alice's coin is un-spent again.
+    try inc.update(&.{G}, &blocks, &heights, policy);
+    try testing.expect(!inc.set.contains(tip_op));
+    try testing.expect(inc.set.contains(alice_coin));
 }

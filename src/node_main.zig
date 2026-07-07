@@ -685,7 +685,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const node = try gpa.create(Node);
-    node.* = .{ .gpa = gpa, .chain = chain.Chain.init(gpa, .{}), .name = name };
+    // Public-chain monetary policy: the block producer collects the fee tip
+    // (EIP-1559). base_fee_rate stays a genesis tuning knob (0 here) until the
+    // real economic parameters are set; the burn mechanism is active regardless.
+    node.* = .{ .gpa = gpa, .chain = chain.Chain.init(gpa, .{ .collect_tips = true }), .name = name };
 
     // Verify the SmartLedger software license (fail-closed if one is supplied
     // but invalid; community tier if none is supplied).

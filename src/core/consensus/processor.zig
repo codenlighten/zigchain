@@ -17,11 +17,15 @@ const hashmod = @import("../crypto/hash.zig");
 const prim = @import("../primitives/types.zig");
 const utxo = @import("../ledger/utxo.zig");
 const val = @import("../ledger/validation.zig");
+const massmod = @import("mass.zig");
+const fees = @import("fees.zig");
 const Ghostdag = @import("ghostdag.zig").Ghostdag;
 
 const Hash256 = hashmod.Hash256;
 const Transaction = prim.Transaction;
 const UtxoSet = utxo.UtxoSet;
+
+pub const Policy = fees.Policy;
 
 pub const BlockTxs = struct {
     id: Hash256,
@@ -46,7 +50,7 @@ pub fn applyOrder(
     gd: *Ghostdag,
     blocks: []const BlockTxs,
     heights: *const std.AutoHashMapUnmanaged(Hash256, u64),
-    maturity: u64,
+    policy: Policy,
 ) !Stats {
     // Index block id -> transactions.
     var by_id: std.AutoHashMapUnmanaged(Hash256, []const Transaction) = .empty;
@@ -64,23 +68,38 @@ pub fn applyOrder(
     for (order) |id| {
         const txs = by_id.get(id) orelse continue; // block carries no txs
         const height = heights.get(id) orelse 0;
+
+        // Mirror ledger_state.applyBlock: track the block's producer and the tips
+        // it earns, then mint the aggregate tip to the coinbase beneficiary. This
+        // recompute path is the differential oracle, so the rule must match
+        // byte-for-byte.
+        var beneficiary: ?prim.Output = null;
+        var cb_txid: Hash256 = undefined;
+        var cb_out_count: usize = 0;
+        var tip_total: u64 = 0;
+
         for (txs) |tx| {
             if (tx.isCoinbase()) {
                 try val.connectTx(set, tx, gpa);
                 const txid = try tx.txid(gpa);
+                if (beneficiary == null and tx.outputs.len > 0) {
+                    beneficiary = tx.outputs[0];
+                    cb_txid = txid;
+                    cb_out_count = tx.outputs.len;
+                }
                 for (tx.outputs, 0..) |_, i| try cb_height.put(gpa, .{ .txid = txid, .index = @intCast(i) }, height);
                 stats.applied += 1;
                 continue;
             }
-            _ = val.validateTx(set, tx, gpa) catch {
+            const fee = val.validateTx(set, tx, gpa) catch {
                 stats.rejected += 1;
                 continue;
             };
             // Coinbase maturity.
             var immature = false;
-            if (maturity != 0) for (tx.inputs) |in| {
+            if (policy.maturity != 0) for (tx.inputs) |in| {
                 if (cb_height.get(in.outpoint)) |cbh| {
-                    if (height < cbh +| maturity) {
+                    if (height < cbh +| policy.maturity) {
                         immature = true;
                         break;
                     }
@@ -93,6 +112,18 @@ pub fn applyOrder(
             for (tx.inputs) |in| _ = cb_height.remove(in.outpoint);
             try val.connectTx(set, tx, gpa);
             stats.applied += 1;
+            if (policy.collect_tips) {
+                const m = massmod.txMass(gpa, tx) catch 0;
+                tip_total +|= fees.split(fee, m, policy.base_fee_rate).tip;
+            }
+        }
+
+        if (policy.collect_tips and tip_total > 0) {
+            if (beneficiary) |b| {
+                const op = OutPoint{ .txid = cb_txid, .index = @intCast(cb_out_count) };
+                try set.add(gpa, op, .{ .value = tip_total, .scheme = b.scheme, .commitment = b.commitment });
+                try cb_height.put(gpa, op, height);
+            }
         }
     }
     return stats;
@@ -184,7 +215,7 @@ test "cross-anticone double-spend resolves to a single deterministic winner" {
     };
 
     var nh: std.AutoHashMapUnmanaged(Hash256, u64) = .empty;
-    const stats = try applyOrder(gpa, &set, &gd, &blocks, &nh, 0);
+    const stats = try applyOrder(gpa, &set, &gd, &blocks, &nh, .{});
 
     // Exactly one of the two conflicting txs is applied; the other is rejected.
     try testing.expectEqual(@as(usize, 1), stats.applied);
@@ -253,7 +284,7 @@ test "self-contained chain: coinbase mints, then the coin is spent" {
         .{ .id = h(2), .txs = &.{ cb_b, alice_spend } },
     };
     var nh: std.AutoHashMapUnmanaged(Hash256, u64) = .empty;
-    const stats = try applyOrder(gpa, &set, &gd, &blocks, &nh, 0);
+    const stats = try applyOrder(gpa, &set, &gd, &blocks, &nh, .{});
 
     try testing.expectEqual(@as(usize, 3), stats.applied); // 2 coinbases + 1 spend
     try testing.expectEqual(@as(usize, 0), stats.rejected);

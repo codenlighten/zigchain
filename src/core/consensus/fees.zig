@@ -20,6 +20,35 @@ pub const FeeParams = struct {
     rate_per_mass: u64 = 1,
 };
 
+/// Economic rules the ledger applies while connecting a block's transactions.
+/// Threaded (unchanged) through both the incremental engine and the
+/// recompute oracle so the two cannot diverge.
+pub const Policy = struct {
+    /// A coinbase output — and any fee tip minted to a producer — cannot be
+    /// spent until this many blocks deep. 0 disables the check.
+    maturity: u64 = 0,
+    /// Mandatory base fee per unit of mass, in base units. The base portion of
+    /// every fee is BURNED (removed from supply). 0 means no base fee.
+    base_fee_rate: u64 = 0,
+    /// When true, the tip (the fee above the base) is minted to the block's
+    /// coinbase beneficiary — the EIP-1559 producer reward. When false the whole
+    /// fee is burned (the v1 default and the model the ledger unit tests assume).
+    collect_tips: bool = false,
+};
+
+pub const Split = struct { base: u64, tip: u64 };
+
+/// EIP-1559 split of a transaction's `fee` given the `tx_mass` it consumes: the
+/// base is the mass-proportional floor (burned), the tip is whatever the sender
+/// attached on top (paid to the producer). A fee below the floor pays all of
+/// itself as base and tips nothing — the mandatory-minimum-fee *rejection* is a
+/// mempool/relay policy at the edge, not a consensus rule, so this never
+/// underflows and never invalidates a block.
+pub fn split(fee: u64, tx_mass: u64, base_fee_rate: u64) Split {
+    const base = @min(fee, tx_mass *| base_fee_rate);
+    return .{ .base = base, .tip = fee - base };
+}
+
 /// The fee floor a transaction pays: its mass times the rate.
 pub fn txFeeZats(gpa: std.mem.Allocator, tx: prim.Transaction, params: FeeParams) massmod.Error!u64 {
     const m = try massmod.txMass(gpa, tx);
@@ -56,4 +85,22 @@ test "fee is mass * rate; amortises across a settlement batch" {
     // The per-transfer fee is still tiny — the signature is paid once.
     const per = perTransferZats(fee, 1000);
     try testing.expect(per > 0 and per < 100);
+}
+
+test "EIP-1559 split: base is the mass floor (burned), tip is the surplus" {
+    // fee 1000, mass 100, rate 3 -> base 300 burned, tip 700 to the producer.
+    const a = split(1000, 100, 3);
+    try testing.expectEqual(@as(u64, 300), a.base);
+    try testing.expectEqual(@as(u64, 700), a.tip);
+    // No base fee configured -> the whole fee is a tip.
+    const b = split(1000, 100, 0);
+    try testing.expectEqual(@as(u64, 0), b.base);
+    try testing.expectEqual(@as(u64, 1000), b.tip);
+    // Fee below the floor: it all becomes base, tips nothing, never underflows.
+    const c = split(50, 100, 3); // floor 300 > fee 50
+    try testing.expectEqual(@as(u64, 50), c.base);
+    try testing.expectEqual(@as(u64, 0), c.tip);
+    // Floor computation saturates instead of overflowing.
+    const d = split(std.math.maxInt(u64), std.math.maxInt(u64), 2);
+    try testing.expectEqual(@as(u64, 0), d.tip); // base saturates to the whole fee
 }

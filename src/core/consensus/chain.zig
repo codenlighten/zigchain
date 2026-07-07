@@ -62,6 +62,12 @@ pub const Config = struct {
     initial_subsidy: u64 = 50,
     halving_interval: u64 = 210_000,
     tail_subsidy: u64 = 1,
+    // EIP-1559 fee split: `base_fee_rate` (per unit of mass) is burned; the tip
+    // above it is minted to the block producer when `collect_tips` is set. The
+    // conservative default burns the whole fee (v1 behaviour); the public-chain
+    // genesis preset enables the producer tip.
+    base_fee_rate: u64 = 0,
+    collect_tips: bool = false,
     max_block_mass: u64 = 1_000_000,
     target_block_ms: u64 = 1000,
     daa_window: u32 = 10,
@@ -164,6 +170,15 @@ pub const Chain = struct {
         return @max(decayed, self.cfg.tail_subsidy);
     }
 
+    /// The maturity + fee rules the ledger applies, drawn from consensus config.
+    pub fn ledgerPolicy(self: *const Chain) ledger_state.Policy {
+        return .{
+            .maturity = self.cfg.coinbase_maturity,
+            .base_fee_rate = self.cfg.base_fee_rate,
+            .collect_tips = self.cfg.collect_tips,
+        };
+    }
+
     /// The difficulty a block with these parents must use, per the DAA.
     pub fn expectedBits(self: *const Chain, parents: []const Hash256) u32 {
         if (parents.len == 0) return self.cfg.genesis_bits;
@@ -226,7 +241,7 @@ pub const Chain = struct {
         try self.txmap.put(self.gpa, id, block.txs);
         const order = try self.gd.?.order(self.gpa);
         defer self.gpa.free(order);
-        try self.led.update(order, &self.txmap, &self.heights, self.cfg.coinbase_maturity);
+        try self.led.update(order, &self.txmap, &self.heights, self.ledgerPolicy());
         return id;
     }
 
