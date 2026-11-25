@@ -3,7 +3,7 @@
 > **Status: experimental.** Claims in this README about scale, speed, security or readiness are design goals or earlier drafts unless they point to a test, measurement or audit report. No independent audit is claimed.
 
 A post-quantum, proof-of-work **BlockDAG** Layer-1 with a **UTXO** ledger and a
-**BFT finality gadget**, written in Zig for government / enterprise settlement.
+**BFT finality gadget**, written in Zig.
 The design bar is *maximally robust and defensible in a security audit*, not
 *ship fast*. See the full architecture plan for the reasoning behind every
 decision (trust model, finality, assurance strategy).
