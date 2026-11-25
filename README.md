@@ -1,5 +1,7 @@
 # ZigChain
 
+> **Status: experimental.** Claims in this README about scale, speed, security or readiness are design goals or earlier drafts unless they point to a test, measurement or audit report. No independent audit is claimed.
+
 A post-quantum, proof-of-work **BlockDAG** Layer-1 with a **UTXO** ledger and a
 **BFT finality gadget**, written in Zig for government / enterprise settlement.
 The design bar is *maximally robust and defensible in a security audit*, not
